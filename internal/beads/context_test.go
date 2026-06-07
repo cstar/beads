@@ -396,6 +396,50 @@ func TestIsPathInSafeBoundary(t *testing.T) {
 	}
 }
 
+// TestResolvedPathWithinRoot exercises the symlink-escape hardening helper added
+// for be-vc1 — the HIGH finding on the /Users/Shared carve-out. The helper must:
+//   (a) accept a real subdirectory under root,
+//   (b) REJECT a symlink under root whose target resolves outside root (the
+//       TOCTOU/path-traversal vector on the world-writable /Users/Shared),
+//   (c) accept a not-yet-created subpath under a real root (a BEADS_DIR that has
+//       not been created yet must still validate, not fail closed).
+//
+// It uses a temp-dir stand-in for root so it runs on every OS — Linux CI thereby
+// proves the escape rejection (the literal /Users/Shared symlink case is darwin-
+// only and lives in TestIsPathInSafeBoundary).
+func TestResolvedPathWithinRoot(t *testing.T) {
+	root := t.TempDir()
+
+	// (a) a real subdirectory under root stays within root.
+	realSub := filepath.Join(root, "real")
+	if err := os.MkdirAll(realSub, 0o755); err != nil {
+		t.Fatalf("mkdir realSub: %v", err)
+	}
+	if !resolvedPathWithinRoot(realSub, root) {
+		t.Errorf("resolvedPathWithinRoot(%q, %q) = false, want true (real subdir under root)", realSub, root)
+	}
+
+	// (b) a symlink under root whose target is outside root must be rejected:
+	// resolving the symlink lands outside the boundary. This is the vector the
+	// security review flagged — /Users/Shared is world-writable, so a co-located
+	// user can plant such a link.
+	outside := t.TempDir() // a distinct temp dir, genuinely outside root
+	escape := filepath.Join(root, "escape")
+	if err := os.Symlink(outside, escape); err != nil {
+		t.Fatalf("symlink escape: %v", err)
+	}
+	if resolvedPathWithinRoot(escape, root) {
+		t.Errorf("resolvedPathWithinRoot(%q -> %q, %q) = true, want false (symlink escapes root)", escape, outside, root)
+	}
+
+	// (c) a not-yet-created subpath under a real root still validates: the helper
+	// resolves the longest existing ancestor and re-appends the missing tail.
+	notYet := filepath.Join(root, "notyet", ".beads")
+	if !resolvedPathWithinRoot(notYet, root) {
+		t.Errorf("resolvedPathWithinRoot(%q, %q) = false, want true (not-yet-created subpath under real root)", notYet, root)
+	}
+}
+
 // TestGetRepoContextForWorkspace_RedirectToUnsafeLocation tests that redirects
 // to unsafe locations are rejected (TS-SEC-003 integration test).
 func TestGetRepoContextForWorkspace_RedirectToUnsafeLocation(t *testing.T) {

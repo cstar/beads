@@ -56,6 +56,14 @@ func newProxiedServerRoutedStore(ctx context.Context, beadsDir string) (storage.
 		ServerUser: "root",
 		// AutoStart stays false: the proxy owns the backend lifecycle. We must
 		// never try to spawn a dolt server for the proxy's listener port.
+		//
+		// RoutedThroughProxy stops newServerMode from persisting pf.Port (the
+		// ephemeral proxy listener) into .beads/dolt-server.port. That file is
+		// the canonical-server discovery hint; a proxy port written there is
+		// clobbered on the next reconcile and goes stale when the proxy respawns
+		// on a new port, breaking endpoint resolution for any reader that trusts
+		// it.
+		RoutedThroughProxy: true,
 	}
 	return dolt.New(ctx, cfg)
 }

@@ -335,9 +335,12 @@ func isPathInSafeBoundary(path string) bool {
 	// user's home — allow it (and its subpaths) before the peer-home rejection
 	// below. SEC-003 guards against path traversal into system directories; the
 	// unsafePrefixes blocklist above stays authoritative, so this carve-out only
-	// admits the shared dir, mirroring the /var/home/ allowance.
+	// admits the shared dir, mirroring the /var/home/ allowance. /Users/Shared is
+	// world-writable (drwxrwxrwt), so resolve symlinks before admitting: a symlink
+	// planted under it whose target escapes the boundary must be rejected, not
+	// followed into a system directory (be-vc1 SEC-003 hardening).
 	if absPath == "/Users/Shared" || strings.HasPrefix(absPath, "/Users/Shared/") {
-		return true
+		return resolvedPathWithinRoot(absPath, "/Users/Shared")
 	}
 
 	// Also reject other users' home directories

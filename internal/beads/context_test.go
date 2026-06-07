@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/steveyegge/beads/internal/git"
@@ -437,6 +438,43 @@ func TestResolvedPathWithinRoot(t *testing.T) {
 	notYet := filepath.Join(root, "notyet", ".beads")
 	if !resolvedPathWithinRoot(notYet, root) {
 		t.Errorf("resolvedPathWithinRoot(%q, %q) = false, want true (not-yet-created subpath under real root)", notYet, root)
+	}
+}
+
+// TestIsPathInSafeBoundary_SharedSymlinkEscape proves, on macOS where /Users/Shared
+// actually exists and is world-writable, that a symlink planted under it whose
+// target escapes the boundary is REJECTED through isPathInSafeBoundary — the live
+// form of the be-vc1 HIGH finding. Skipped on non-darwin and when /Users/Shared is
+// absent or not writable, so it never fails spuriously on CI runners.
+func TestIsPathInSafeBoundary_SharedSymlinkEscape(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("/Users/Shared is a macOS-specific shared directory")
+	}
+	const shared = "/Users/Shared"
+	if info, err := os.Stat(shared); err != nil || !info.IsDir() {
+		t.Skipf("%s not present as a directory: %v", shared, err)
+	}
+
+	// Plant a symlink under the world-writable /Users/Shared pointing OUTSIDE the
+	// boundary, at /etc (a system dir). Best-effort clear of any stale link from a
+	// crashed run, then register cleanup.
+	link := filepath.Join(shared, fmt.Sprintf(".be-vc1-escape-test-%d", os.Getpid()))
+	_ = os.Remove(link)
+	if err := os.Symlink("/etc", link); err != nil {
+		t.Skipf("cannot create symlink in %s (not writable?): %v", shared, err)
+	}
+	t.Cleanup(func() { _ = os.Remove(link) })
+
+	// A BEADS_DIR routed *through* the escaping symlink must be rejected: its bytes
+	// resolve into /etc, outside /Users/Shared.
+	target := filepath.Join(link, ".beads")
+	if isPathInSafeBoundary(target) {
+		t.Errorf("isPathInSafeBoundary(%q) = true, want false (path through symlink escaping /Users/Shared to /etc)", target)
+	}
+
+	// The escaping symlink itself also resolves outside the boundary.
+	if isPathInSafeBoundary(link) {
+		t.Errorf("isPathInSafeBoundary(%q) = true, want false (symlink under /Users/Shared escaping to /etc)", link)
 	}
 }
 

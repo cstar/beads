@@ -331,6 +331,15 @@ func isPathInSafeBoundary(path string) bool {
 			return false
 		}
 	}
+	// macOS's /Users/Shared is the OS-designated shared directory, not a peer
+	// user's home — allow it (and its subpaths) before the peer-home rejection
+	// below. SEC-003 guards against path traversal into system directories; the
+	// unsafePrefixes blocklist above stays authoritative, so this carve-out only
+	// admits the shared dir, mirroring the /var/home/ allowance.
+	if absPath == "/Users/Shared" || strings.HasPrefix(absPath, "/Users/Shared/") {
+		return true
+	}
+
 	// Also reject other users' home directories
 	homeDir, _ := os.UserHomeDir()
 	if strings.HasPrefix(absPath, "/Users/") || strings.HasPrefix(absPath, "/home/") || strings.HasPrefix(absPath, "/var/home/") {

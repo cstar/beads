@@ -375,6 +375,15 @@ func TestIsPathInSafeBoundary(t *testing.T) {
 		// Safe paths - should be accepted
 		{"user home directory", filepath.Join(homeDir, "projects/.beads"), true},
 		{"temp directory", os.TempDir(), true},
+
+		// macOS /Users/Shared is the OS-designated shared directory, not a peer
+		// user's home — it must be accepted (be-vc1 / SEC-003 carve-out).
+		{"macOS shared subdir", "/Users/Shared/portharbour/.beads", true},
+		{"macOS shared root", "/Users/Shared", true},
+
+		// Regression guard: a genuine peer user's home (not /Users/Shared) must
+		// still be rejected, proving the carve-out does not over-broaden SEC-003.
+		{"peer user home", "/Users/_peer_nonexistent/.beads", false},
 	}
 
 	for _, tt := range tests {

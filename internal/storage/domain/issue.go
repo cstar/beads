@@ -441,6 +441,12 @@ func (u *issueUseCaseImpl) create(ctx context.Context, params CreateIssueParams,
 
 	result := CreateIssueResult{Issue: issue}
 
+	// Sources of dependency edges inserted below. is_blocked is recomputed
+	// for them before returning so bd ready (is_blocked = 0) cannot surface a
+	// bead that was born with an open blocker (the create paths previously
+	// skipped the maintenance the standalone dep-add path performs).
+	var depSources []string
+
 	if params.ParentID != "" {
 		pcDep := &types.Dependency{
 			IssueID:     issue.ID,
@@ -451,6 +457,7 @@ func (u *issueUseCaseImpl) create(ctx context.Context, params CreateIssueParams,
 			return result, fmt.Errorf("create: add parent-child dep: %w", err)
 		}
 		result.PostCreateWrites = true
+		depSources = append(depSources, pcDep.IssueID)
 	}
 
 	if params.InheritLabelsFromParent && params.ParentID != "" {
@@ -495,6 +502,7 @@ func (u *issueUseCaseImpl) create(ctx context.Context, params CreateIssueParams,
 			return result, fmt.Errorf("create: add dep %s -> %s: %w", dep.IssueID, dep.DependsOnID, err)
 		}
 		result.PostCreateWrites = true
+		depSources = append(depSources, dep.IssueID)
 	}
 
 	if params.WaitsFor != nil {
@@ -516,9 +524,38 @@ func (u *issueUseCaseImpl) create(ctx context.Context, params CreateIssueParams,
 			return result, fmt.Errorf("create: add waits-for: %w", err)
 		}
 		result.PostCreateWrites = true
+		depSources = append(depSources, dep.IssueID)
+	}
+
+	if len(depSources) > 0 {
+		issueIDs, wispIDs := splitBlockedRecomputeIDs(depSources, useWisp)
+		if err := u.depRepo.RecomputeIsBlocked(ctx, issueIDs, wispIDs); err != nil {
+			return result, fmt.Errorf("create: recompute is_blocked: %w", err)
+		}
 	}
 
 	return result, nil
+}
+
+// splitBlockedRecomputeIDs buckets dependency source IDs for is_blocked
+// recomputation, deduplicating while preserving order. All IDs go to the
+// bucket of the issue being created (useWisp), matching the embedded batch
+// path (issueops createBlockedRecomputeIDs): a swap-direction source living
+// in the other table simply no-ops in the recompute UPDATE's IN clause.
+func splitBlockedRecomputeIDs(ids []string, useWisp bool) (issueIDs, wispIDs []string) {
+	seen := make(map[string]bool, len(ids))
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	if useWisp {
+		return nil, out
+	}
+	return out, nil
 }
 
 func (u *issueUseCaseImpl) CreateIssues(ctx context.Context, params []CreateIssueParams, actor string) (CreateIssuesResult, error) {
@@ -636,6 +673,13 @@ func (u *issueUseCaseImpl) applyGraph(ctx context.Context, plan GraphPlan, actor
 	// live deps. In that case the per-edge HasCycle SQL probe is skipped.
 	// Edges that reference external IDs always pay for HasCycle.
 	planCanSkipCycleCheck := applyGraphPlanCanSkipSQLCycleChecks(plan)
+	// Dependency edge sources accumulated across passes 3 and 4 plus every
+	// created node; is_blocked is recomputed for the whole set after the last
+	// dep insert so a freshly poured graph starts with correct ready state.
+	depSources := make([]string, 0, len(plan.Nodes)+len(plan.Edges))
+	for _, id := range keyToID {
+		depSources = append(depSources, id)
+	}
 	for i, edge := range plan.Edges {
 		fromID := resolveEdgeRef(edge.FromKey, edge.FromID, keyToID)
 		if fromID == "" {
@@ -678,6 +722,7 @@ func (u *issueUseCaseImpl) applyGraph(ctx context.Context, plan GraphPlan, actor
 		if err := u.depRepo.Insert(ctx, dep, actor, DepInsertOpts{UseWispsTable: useWisp}); err != nil {
 			return GraphApplyResult{}, fmt.Errorf("applyGraph: edge %d (%s -> %s): %w", i, fromID, toID, err)
 		}
+		depSources = append(depSources, fromID)
 	}
 
 	// Pass 4 — insert parent-child deps now that all IDs are known.
@@ -698,6 +743,12 @@ func (u *issueUseCaseImpl) applyGraph(ctx context.Context, plan GraphPlan, actor
 		if err := u.depRepo.Insert(ctx, dep, actor, DepInsertOpts{UseWispsTable: useWisp}); err != nil {
 			return GraphApplyResult{}, fmt.Errorf("applyGraph: node %q: parent-child dep %s->%s: %w", node.Key, childID, parentID, err)
 		}
+		depSources = append(depSources, childID)
+	}
+
+	issueIDs, wispIDs := splitBlockedRecomputeIDs(depSources, useWisp)
+	if err := u.depRepo.RecomputeIsBlocked(ctx, issueIDs, wispIDs); err != nil {
+		return GraphApplyResult{}, fmt.Errorf("applyGraph: recompute is_blocked: %w", err)
 	}
 
 	// Pass 5 — apply deferred assignees.

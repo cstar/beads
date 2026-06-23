@@ -41,6 +41,7 @@ import (
 	"github.com/steveyegge/beads/internal/doltserver"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/doltutil"
+	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/storage/schema"
 	"github.com/steveyegge/beads/internal/storage/versioncontrolops"
 	"github.com/steveyegge/beads/internal/types"
@@ -2335,13 +2336,295 @@ func (s *DoltStore) pullWithAutoResolve(ctx context.Context, query string, args 
 		return resolveErr
 	}
 
-	if pullErr != nil && !resolved {
-		// Pull failed for a non-conflict reason, or conflicts include non-metadata tables.
+	// ADR-0018 Layer 2: a 3-way merge can leave FK constraint violations in
+	// dolt_constraint_violations_* (NOT dolt_conflicts) when OURS deletes a
+	// parent issue (FK ON DELETE CASCADE removes its children on OURS) while
+	// THEIRS adds a label/event for that still-live issue. Dolt's merge does
+	// not re-fire cascades, so orphan child rows block the commit. Attempt to
+	// resolve these regardless of whether metadata conflicts existed — a single
+	// merge can produce both kinds.
+	fkResolved, fkResolveErr := s.tryAutoResolveFKConstraintViolations(ctx, tx)
+	if fkResolveErr != nil {
+		_ = tx.Rollback()
+		if pullErr != nil {
+			return pullErr
+		}
+		return fkResolveErr
+	}
+
+	if pullErr != nil && !resolved && !fkResolved {
+		// Pull failed for a non-conflict reason, or conflicts/violations include
+		// tables/kinds we cannot safely auto-resolve.
 		_ = tx.Rollback()
 		return pullErr
 	}
 
 	return tx.Commit()
+}
+
+// issueChildTables maps each table that has a FOREIGN KEY ... REFERENCES
+// issues(id) ON DELETE CASCADE to the column(s) on that table holding the
+// referenced issue id. These are the only tables for which we know the safe
+// THEIRS-wins re-parenting / both-sides-absent orphan-delete resolution
+// (ADR-0018 Layer 2). Any FK violation on a table outside this set is surfaced
+// rather than auto-resolved.
+//
+// Verified against internal/storage/schema/migrations/ (0003 labels, 0005
+// events, 0004 comments, 0009 issue_snapshots, 0010 compaction_snapshots all
+// FK on issue_id; 0002/0041/0043 dependencies FK on BOTH issue_id and
+// depends_on_issue_id). The auxiliary wisp_* / child_counters cascade tables
+// are intentionally out of scope for L2.
+var issueChildTables = map[string][]string{
+	"labels":               {"issue_id"},
+	"events":               {"issue_id"},
+	"comments":             {"issue_id"},
+	"issue_snapshots":      {"issue_id"},
+	"compaction_snapshots": {"issue_id"},
+	"dependencies":         {"issue_id", "depends_on_issue_id"},
+}
+
+// tryAutoResolveFKConstraintViolations resolves foreign-key constraint
+// violations left in dolt_constraint_violations_* after a 3-way merge
+// (ADR-0018 Layer 2). It mirrors the structure of
+// tryAutoResolveMetadataConflicts.
+//
+// Returns (true, nil) if ALL violations were of a handled kind and were
+// resolved; (false, nil) if there is nothing to do or if ANY violation is of a
+// kind/table we cannot classify (so the caller falls back to the existing
+// error path — we NEVER guess); (false, err) on a hard failure.
+//
+// DATA-LOSS SENSITIVE: each orphan child row is only deleted when its parent
+// issue is absent on BOTH the THEIRS side and local HEAD. When the parent is
+// live on THEIRS, the parent issue row is re-inserted from THEIRS (preserving
+// the remote-live data) instead of deleting the child. We NEVER blanket-DELETE
+// violation rows.
+func (s *DoltStore) tryAutoResolveFKConstraintViolations(ctx context.Context, tx *sql.Tx) (bool, error) {
+	// THEIRS ref: after DOLT_FETCH/DOLT_PULL the remote-tracking branch is
+	// available as remotes/<remote>/<branch>. AS OF reads work against it.
+	theirsRef := "remotes/" + s.remote + "/" + s.branch
+	return s.tryAutoResolveFKConstraintViolationsWithRef(ctx, tx, theirsRef)
+}
+
+// tryAutoResolveFKConstraintViolationsWithRef is the ref-parameterized core of
+// tryAutoResolveFKConstraintViolations. theirsRef is the ref (branch or
+// remote-tracking ref) whose issue rows represent the THEIRS side of the merge.
+// Split out so tests can drive it against a local THEIRS branch.
+func (s *DoltStore) tryAutoResolveFKConstraintViolationsWithRef(ctx context.Context, tx *sql.Tx, theirsRef string) (bool, error) {
+	// 1. Summary table: one row per table that has violations.
+	rows, err := tx.QueryContext(ctx, "SELECT `table`, num_violations FROM dolt_constraint_violations")
+	if err != nil {
+		return false, fmt.Errorf("failed to query constraint violations: %w", err)
+	}
+	type violatedTable struct {
+		table string
+		count int
+	}
+	var tables []violatedTable
+	for rows.Next() {
+		var vt violatedTable
+		if err := rows.Scan(&vt.table, &vt.count); err != nil {
+			_ = rows.Close()
+			return false, fmt.Errorf("failed to scan constraint violation summary: %w", err)
+		}
+		tables = append(tables, vt)
+	}
+	_ = rows.Close()
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	if len(tables) == 0 {
+		return false, nil // Nothing to do — error (if any) was something else.
+	}
+
+	// 2. Only proceed if EVERY violating table is a known issue-child table.
+	//    If any is unknown, surface it (do not guess).
+	for _, vt := range tables {
+		if _, ok := issueChildTables[vt.table]; !ok {
+			return false, nil
+		}
+	}
+
+	// 3. Resolve each violating table; collect the affected tables for staging.
+	affectedTables := make([]string, 0, len(tables))
+	for _, vt := range tables {
+		affectedTables = append(affectedTables, vt.table)
+		if err := s.resolveFKViolationsForTable(ctx, tx, vt.table, issueChildTables[vt.table], theirsRef); err != nil {
+			return false, err
+		}
+	}
+
+	// 4. Clear the violation rows we just resolved, stage the affected data
+	//    tables, and commit.
+	for _, table := range affectedTables {
+		// nolint:gosec // G201: table is constrained to issueChildTables keys (constant set).
+		clearStmt := fmt.Sprintf("DELETE FROM dolt_constraint_violations_%s", table)
+		if _, err := tx.ExecContext(ctx, clearStmt); err != nil {
+			return false, fmt.Errorf("failed to clear constraint violations for %s: %w", table, err)
+		}
+	}
+	// Stage the parent issues table (it may have been re-inserted into) plus
+	// every affected child table.
+	addArgs := append([]any{"issues"}, toAnySlice(affectedTables)...)
+	addPlaceholders := strings.Repeat("?, ", len(addArgs))
+	addPlaceholders = strings.TrimSuffix(addPlaceholders, ", ")
+	// nolint:gosec // G201: only placeholders are interpolated; values are bound.
+	if _, err := tx.ExecContext(ctx, "CALL DOLT_ADD("+addPlaceholders+")", addArgs...); err != nil {
+		return false, fmt.Errorf("failed to stage tables after FK resolution: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, "CALL DOLT_COMMIT('-m', 'auto-resolve FK constraint violations after merge (ADR-0018 L2)')"); err != nil {
+		return false, fmt.Errorf("failed to commit resolved FK violations: %w", err)
+	}
+
+	return true, nil
+}
+
+// resolveFKViolationsForTable resolves the FK constraint violations recorded in
+// dolt_constraint_violations_<table>. fkColumns lists the column(s) on the table
+// that reference issues(id) (e.g. dependencies references BOTH issue_id and
+// depends_on_issue_id). For each violation row and each FK column, the
+// referenced parent issue is checked: if it is live on THEIRS, the parent issue
+// row is re-inserted from THEIRS (safe path, preserving remote-live data); if it
+// is absent on BOTH THEIRS and local HEAD, the violated child row is genuinely
+// orphaned and is deleted. See tryAutoResolveFKConstraintViolations for the
+// data-loss safety contract. Any non-foreign-key violation_type is surfaced.
+func (s *DoltStore) resolveFKViolationsForTable(ctx context.Context, tx *sql.Tx, table string, fkColumns []string, theirsRef string) error {
+	if len(fkColumns) == 0 {
+		return fmt.Errorf("no FK columns configured for table %s", table)
+	}
+
+	// Build the projection: violation_type + every FK column. The violation
+	// table mirrors the base table's columns, so each FK column is present.
+	// nolint:gosec // G201: table and fkColumns come from issueChildTables (constant set).
+	cols := "violation_type"
+	for _, c := range fkColumns {
+		cols += ", " + c
+	}
+	vQuery := fmt.Sprintf("SELECT %s FROM dolt_constraint_violations_%s", cols, table)
+	vrows, err := tx.QueryContext(ctx, vQuery)
+	if err != nil {
+		return fmt.Errorf("failed to query dolt_constraint_violations_%s: %w", table, err)
+	}
+
+	// For each FK column, the set of referenced issue ids that violated.
+	orphanIDsByCol := make([]map[string]bool, len(fkColumns))
+	for i := range orphanIDsByCol {
+		orphanIDsByCol[i] = make(map[string]bool)
+	}
+	var unclassifiable bool
+	for vrows.Next() {
+		dest := make([]any, 1+len(fkColumns))
+		var vType string
+		dest[0] = &vType
+		colVals := make([]sql.NullString, len(fkColumns))
+		for i := range fkColumns {
+			dest[i+1] = &colVals[i]
+		}
+		if err := vrows.Scan(dest...); err != nil {
+			_ = vrows.Close()
+			return fmt.Errorf("failed to scan violation row for %s: %w", table, err)
+		}
+		// Dolt reports FK violations with violation_type = "foreign key".
+		if vType != "foreign key" {
+			unclassifiable = true
+			continue
+		}
+		for i, v := range colVals {
+			if v.Valid && v.String != "" {
+				orphanIDsByCol[i][v.String] = true
+			}
+		}
+	}
+	_ = vrows.Close()
+	if err := vrows.Err(); err != nil {
+		return err
+	}
+	if unclassifiable {
+		// Surface rather than guess. Returning an error rolls the caller back to
+		// the original pull error / non-resolved path.
+		return fmt.Errorf("dolt_constraint_violations_%s contains a non-foreign-key violation; not auto-resolving", table)
+	}
+
+	for i, fkCol := range fkColumns {
+		for issueID := range orphanIDsByCol[i] {
+			// Is the referenced parent issue present on the THEIRS side?
+			present, err := s.issueExistsAsOf(ctx, tx, issueID, theirsRef)
+			if err != nil {
+				return err
+			}
+			if present {
+				// CRITICAL SAFE PATH: re-insert the parent issue locally from the
+				// THEIRS version, preserving the remote-live data. INSERT IGNORE
+				// keeps this idempotent if the row already exists locally (it may
+				// have been re-inserted for an earlier FK column / table).
+				//
+				// SELECT * (rather than an explicit column list): a Dolt 3-way
+				// merge requires both sides to share the same table schema, and
+				// theirsRef is that same merge's THEIRS commit, so the issues
+				// schema at theirsRef is identical to the local schema. A full-row
+				// copy therefore stays correct across schema migrations without a
+				// brittle, hand-maintained column list (the issues table has 40+
+				// columns and grows via migrations). There is no reusable issues
+				// column-list constant in issueops to borrow.
+				if err := issueops.ValidateRef(theirsRef); err != nil {
+					return fmt.Errorf("invalid theirs ref %q: %w", theirsRef, err)
+				}
+				// nolint:gosec // G201: theirsRef validated above; issueID is bound.
+				reinsert := fmt.Sprintf("INSERT IGNORE INTO issues SELECT * FROM issues AS OF '%s' WHERE id = ?", theirsRef)
+				if _, err := tx.ExecContext(ctx, reinsert, issueID); err != nil {
+					return fmt.Errorf("failed to re-insert parent issue %s from THEIRS: %w", issueID, err)
+				}
+				continue
+			}
+
+			// Parent absent on THEIRS — only delete the orphaned children if the
+			// parent is ALSO absent on local HEAD (genuinely orphaned both sides).
+			presentLocal, err := s.issueExistsAsOf(ctx, tx, issueID, "HEAD")
+			if err != nil {
+				return err
+			}
+			if presentLocal {
+				// Parent live on OURS but child violates FK and parent gone on
+				// THEIRS — this is not the cascade-vs-add case we know how to
+				// resolve. Surface it rather than guess.
+				return fmt.Errorf("FK violation on %s.%s for issue %s: parent present on local HEAD but absent on THEIRS; not auto-resolving", table, fkCol, issueID)
+			}
+			// Genuinely orphaned both sides → delete the orphaned child rows
+			// whose FK column references this now-confirmed-absent issue.
+			// nolint:gosec // G201: table/fkCol come from issueChildTables (constant set); issueID is bound.
+			del := fmt.Sprintf("DELETE FROM %s WHERE %s = ?", table, fkCol)
+			if _, err := tx.ExecContext(ctx, del, issueID); err != nil {
+				return fmt.Errorf("failed to delete orphaned %s rows (%s=%s): %w", table, fkCol, issueID, err)
+			}
+		}
+	}
+	return nil
+}
+
+// issueExistsAsOf reports whether an issue row exists at the given ref.
+func (s *DoltStore) issueExistsAsOf(ctx context.Context, tx *sql.Tx, issueID, ref string) (bool, error) {
+	if err := issueops.ValidateRef(ref); err != nil {
+		return false, fmt.Errorf("invalid ref %q: %w", ref, err)
+	}
+	// nolint:gosec // G201: ref validated by ValidateRef above; issueID is bound.
+	q := fmt.Sprintf("SELECT 1 FROM issues AS OF '%s' WHERE id = ?", ref)
+	var one int
+	err := tx.QueryRowContext(ctx, q, issueID).Scan(&one)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("checking issue %s existence as of %s: %w", issueID, ref, err)
+	}
+	return true, nil
+}
+
+// toAnySlice converts a []string to []any for variadic SQL args.
+func toAnySlice(ss []string) []any {
+	out := make([]any, len(ss))
+	for i, s := range ss {
+		out[i] = s
+	}
+	return out
 }
 
 // tryAutoResolveMetadataConflicts checks if all merge conflicts are on the metadata

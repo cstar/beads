@@ -1,8 +1,265 @@
 package dolt
 
 import (
+	"context"
+	"database/sql"
 	"testing"
 )
+
+// TestPullAutoResolveFKConstraintViolations verifies ADR-0018 Layer 2:
+// a 3-way merge that deletes a parent issue on OURS (cascade-removing its
+// children) while THEIRS adds a child row (label) for that still-live issue
+// leaves an FK constraint violation in dolt_constraint_violations_labels.
+// tryAutoResolveFKConstraintViolations must re-insert the parent issue from
+// THEIRS (the safe path) so the commit succeeds and both the issue and its
+// label survive.
+func TestPullAutoResolveFKConstraintViolations(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	db := store.db
+
+	var currentBranch string
+	if err := db.QueryRowContext(ctx, "SELECT active_branch()").Scan(&currentBranch); err != nil {
+		t.Fatalf("failed to get current branch: %v", err)
+	}
+
+	// Base commit: issue X exists (no children yet). This is the common
+	// ancestor both sides diverge from.
+	if _, err := db.ExecContext(ctx,
+		"INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type) VALUES ('fk-test-x', 'X', '', '', '', '', 'open', 2, 'task')"); err != nil {
+		t.Fatalf("failed to insert base issue: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'base: issue X')"); err != nil {
+		t.Fatalf("failed to commit base: %v", err)
+	}
+
+	// THEIRS branch from the base (HEAD): adds a label for X (X stays live).
+	remoteBranch := currentBranch + "_fkremote"
+	if _, err := db.ExecContext(ctx, "CALL DOLT_BRANCH(?, 'HEAD')", remoteBranch); err != nil {
+		t.Fatalf("failed to create remote branch: %v", err)
+	}
+	defer func() {
+		db.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", currentBranch)
+		db.ExecContext(ctx, "CALL DOLT_BRANCH('-D', ?)", remoteBranch)
+	}()
+
+	if _, err := db.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", remoteBranch); err != nil {
+		t.Fatalf("failed to checkout remote branch: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "INSERT INTO labels (issue_id, label) VALUES ('fk-test-x', 'urgent')"); err != nil {
+		t.Fatalf("failed to insert label on remote branch: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'theirs: label on X')"); err != nil {
+		t.Fatalf("failed to commit on remote branch: %v", err)
+	}
+
+	// OURS (current branch): DELETE issue X (FK ON DELETE CASCADE removes any
+	// children of X on OURS — there are none yet).
+	if _, err := db.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", currentBranch); err != nil {
+		t.Fatalf("failed to checkout current branch: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "DELETE FROM issues WHERE id = 'fk-test-x'"); err != nil {
+		t.Fatalf("failed to delete issue on current branch: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'ours: delete X')"); err != nil {
+		t.Fatalf("failed to commit delete on current branch: %v", err)
+	}
+
+	// Merge THEIRS into OURS. The merge combines OURS deleting X with THEIRS
+	// adding labels(X) — Dolt does not re-fire the cascade, so the label row
+	// orphans into dolt_constraint_violations_labels.
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("failed to begin transaction: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx, "SET @@dolt_allow_commit_conflicts = 1"); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("failed to set dolt_allow_commit_conflicts: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx, "SET @@dolt_force_transaction_commit = 1"); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("failed to set dolt_force_transaction_commit: %v", err)
+	}
+	_, mergeErr := tx.ExecContext(ctx, "CALL DOLT_MERGE(?)", remoteBranch)
+	t.Logf("merge result: %v", mergeErr)
+
+	// Verify the violation actually landed; if Dolt auto-handled it, skip.
+	var nViol int
+	_ = tx.QueryRowContext(ctx, "SELECT COALESCE(SUM(num_violations),0) FROM dolt_constraint_violations").Scan(&nViol)
+	t.Logf("constraint violations after merge: %d", nViol)
+	if nViol == 0 {
+		_ = tx.Rollback()
+		t.Skip("merge produced no FK constraint violations on this Dolt version — cannot exercise resolution path")
+	}
+
+	// The helper uses theirsRef = remotes/<remote>/<branch>. The test has no
+	// real remote tracking branch, so point AS OF reads at the local THEIRS
+	// branch by setting the store's remote/branch so the computed ref resolves.
+	// remotes/<remoteBranch> is not valid; instead we directly call the
+	// per-table resolver with the local THEIRS branch as the ref to exercise
+	// the core logic, then mirror the wrapper's commit.
+	resolved, resolveErr := store.tryAutoResolveFKConstraintViolationsWithRef(ctx, tx, remoteBranch)
+	if resolveErr != nil {
+		_ = tx.Rollback()
+		t.Fatalf("tryAutoResolveFKConstraintViolations error: %v (mergeErr: %v)", resolveErr, mergeErr)
+	}
+	if !resolved {
+		_ = tx.Rollback()
+		t.Fatalf("FK violations were not auto-resolved (mergeErr: %v)", mergeErr)
+	}
+
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("failed to commit after FK auto-resolve: %v", err)
+	}
+
+	// Issue X must be live again (re-inserted from THEIRS) AND its label present.
+	var idCount int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM issues WHERE id = 'fk-test-x'").Scan(&idCount); err != nil {
+		t.Fatalf("failed to count issue X: %v", err)
+	}
+	if idCount != 1 {
+		t.Errorf("expected issue X to be re-inserted (count 1), got %d", idCount)
+	}
+	var labelCount int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM labels WHERE issue_id = 'fk-test-x' AND label = 'urgent'").Scan(&labelCount); err != nil {
+		t.Fatalf("failed to count label: %v", err)
+	}
+	if labelCount != 1 {
+		t.Errorf("expected label on X to survive (count 1), got %d", labelCount)
+	}
+}
+
+// TestPullAutoResolveFKViolationsOrphanBothSides verifies the both-sides-absent
+// path: when the parent issue is gone on BOTH the THEIRS ref and local HEAD,
+// the orphaned child rows are DELETED (not re-inserted) and resolution
+// succeeds.
+//
+// The orphan is manufactured exactly as in the positive test (OURS deletes Y,
+// THEIRS adds a label to still-live Y → FK violation on labels). To exercise
+// the delete branch deterministically we drive the resolver with a THEIRS ref
+// on which Y does NOT exist — the OURS pre-merge commit (HEAD~1), where Y has
+// already been deleted. With Y absent on both that ref and local HEAD the
+// resolver must delete the orphaned label rows.
+func TestPullAutoResolveFKViolationsOrphanBothSides(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	db := store.db
+
+	var currentBranch string
+	if err := db.QueryRowContext(ctx, "SELECT active_branch()").Scan(&currentBranch); err != nil {
+		t.Fatalf("failed to get current branch: %v", err)
+	}
+
+	// Base: issue Y exists (no children yet).
+	if _, err := db.ExecContext(ctx,
+		"INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type) VALUES ('fk-orphan-y', 'Y', '', '', '', '', 'open', 2, 'task')"); err != nil {
+		t.Fatalf("failed to insert base issue: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'base: issue Y')"); err != nil {
+		t.Fatalf("failed to commit base: %v", err)
+	}
+
+	// THEIRS branch from base: add a label for still-live Y.
+	remoteBranch := currentBranch + "_orphanremote"
+	if _, err := db.ExecContext(ctx, "CALL DOLT_BRANCH(?, 'HEAD')", remoteBranch); err != nil {
+		t.Fatalf("failed to create remote branch: %v", err)
+	}
+	defer func() {
+		db.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", currentBranch)
+		db.ExecContext(ctx, "CALL DOLT_BRANCH('-D', ?)", remoteBranch)
+	}()
+
+	if _, err := db.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", remoteBranch); err != nil {
+		t.Fatalf("failed to checkout remote branch: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "INSERT INTO labels (issue_id, label) VALUES ('fk-orphan-y', 'extra')"); err != nil {
+		t.Fatalf("failed to insert label on remote branch: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'theirs: label on Y')"); err != nil {
+		t.Fatalf("failed to commit on remote branch: %v", err)
+	}
+
+	// OURS: delete Y (cascade removes nothing locally). This commit becomes
+	// HEAD~1 after the merge commit, and Y is absent on it.
+	if _, err := db.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", currentBranch); err != nil {
+		t.Fatalf("failed to checkout current branch: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "DELETE FROM issues WHERE id = 'fk-orphan-y'"); err != nil {
+		t.Fatalf("failed to delete issue on current branch: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'ours: delete Y')"); err != nil {
+		t.Fatalf("failed to commit delete on current branch: %v", err)
+	}
+	// Capture the OURS pre-merge commit hash to use as a THEIRS ref where Y is
+	// absent (ValidateRef rejects '~', so we cannot pass HEAD~1 literally).
+	var oursCommit string
+	if err := db.QueryRowContext(ctx, "SELECT commit_hash FROM dolt_log LIMIT 1").Scan(&oursCommit); err != nil {
+		t.Fatalf("failed to get OURS commit hash: %v", err)
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("failed to begin transaction: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx, "SET @@dolt_allow_commit_conflicts = 1"); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("failed to set dolt_allow_commit_conflicts: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx, "SET @@dolt_force_transaction_commit = 1"); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("failed to set dolt_force_transaction_commit: %v", err)
+	}
+	_, mergeErr := tx.ExecContext(ctx, "CALL DOLT_MERGE(?)", remoteBranch)
+	t.Logf("merge result: %v", mergeErr)
+
+	var nViol int
+	_ = tx.QueryRowContext(ctx, "SELECT COALESCE(SUM(num_violations),0) FROM dolt_constraint_violations").Scan(&nViol)
+	t.Logf("constraint violations after merge: %d", nViol)
+	if nViol == 0 {
+		_ = tx.Rollback()
+		t.Skip("merge produced no FK constraint violations on this Dolt version — cannot exercise orphan-delete path")
+	}
+
+	// Drive the resolver with the pre-merge OURS commit as the THEIRS ref. Y is
+	// absent there AND on local HEAD → resolver must DELETE the orphaned label
+	// rows, not re-insert Y.
+	resolved, resolveErr := store.tryAutoResolveFKConstraintViolationsWithRef(ctx, tx, oursCommit)
+	if resolveErr != nil {
+		_ = tx.Rollback()
+		t.Fatalf("tryAutoResolveFKConstraintViolations error: %v (mergeErr: %v)", resolveErr, mergeErr)
+	}
+	if !resolved {
+		_ = tx.Rollback()
+		t.Fatalf("FK violations were not auto-resolved (mergeErr: %v)", mergeErr)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("failed to commit after FK auto-resolve: %v", err)
+	}
+
+	// Y must stay absent, and no label rows for Y should remain.
+	var idCount int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM issues WHERE id = 'fk-orphan-y'").Scan(&idCount); err != nil {
+		t.Fatalf("failed to count issue Y: %v", err)
+	}
+	if idCount != 0 {
+		t.Errorf("expected issue Y to stay deleted (count 0), got %d", idCount)
+	}
+	var labelCount int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM labels WHERE issue_id = 'fk-orphan-y'").Scan(&labelCount); err != nil {
+		t.Fatalf("failed to count labels for Y: %v", err)
+	}
+	if labelCount != 0 {
+		t.Errorf("expected orphaned labels for Y to be deleted (count 0), got %d", labelCount)
+	}
+}
 
 // TestPullAutoResolveMetadataConflicts verifies that merge conflicts limited to
 // the metadata table are automatically resolved with "theirs" strategy (GH#2466).
@@ -100,6 +357,346 @@ func TestPullAutoResolveMetadataConflicts(t *testing.T) {
 	}
 	if value != "bbb" {
 		t.Errorf("expected metadata value 'bbb' (theirs), got %q", value)
+	}
+}
+
+// fkMergeViolation is shared setup for the FK tests: on a base commit issue
+// `issueID` exists; THEIRS (returned remoteBranch) adds a child row referencing
+// it via `childInsert`; OURS deletes the issue. It performs the merge inside the
+// returned tx and reports how many constraint violations resulted. Callers must
+// Rollback/Commit the tx. Returns nViol==0 when Dolt auto-merged (caller should
+// skip).
+func fkMergeViolation(t *testing.T, store *DoltStore, ctx context.Context, issueID, childInsert string) (tx *sql.Tx, remoteBranch string, mergeErr error, nViol int) {
+	t.Helper()
+	db := store.db
+
+	var currentBranch string
+	if err := db.QueryRowContext(ctx, "SELECT active_branch()").Scan(&currentBranch); err != nil {
+		t.Fatalf("failed to get current branch: %v", err)
+	}
+
+	if _, err := db.ExecContext(ctx,
+		"INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type) VALUES (?, 'parent', '', '', '', '', 'open', 2, 'task')", issueID); err != nil {
+		t.Fatalf("failed to insert base issue: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'base: parent issue')"); err != nil {
+		t.Fatalf("failed to commit base: %v", err)
+	}
+
+	remoteBranch = currentBranch + "_fkr"
+	if _, err := db.ExecContext(ctx, "CALL DOLT_BRANCH(?, 'HEAD')", remoteBranch); err != nil {
+		t.Fatalf("failed to create remote branch: %v", err)
+	}
+	t.Cleanup(func() {
+		db.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", currentBranch)
+		db.ExecContext(ctx, "CALL DOLT_BRANCH('-D', ?)", remoteBranch)
+	})
+
+	if _, err := db.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", remoteBranch); err != nil {
+		t.Fatalf("failed to checkout remote branch: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, childInsert); err != nil {
+		t.Fatalf("failed to insert child on remote branch: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'theirs: child row')"); err != nil {
+		t.Fatalf("failed to commit on remote branch: %v", err)
+	}
+
+	if _, err := db.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", currentBranch); err != nil {
+		t.Fatalf("failed to checkout current branch: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "DELETE FROM issues WHERE id = ?", issueID); err != nil {
+		t.Fatalf("failed to delete issue on current branch: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'ours: delete parent')"); err != nil {
+		t.Fatalf("failed to commit delete on current branch: %v", err)
+	}
+
+	var err error
+	tx, err = db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("failed to begin transaction: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx, "SET @@dolt_allow_commit_conflicts = 1"); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("failed to set dolt_allow_commit_conflicts: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx, "SET @@dolt_force_transaction_commit = 1"); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("failed to set dolt_force_transaction_commit: %v", err)
+	}
+	_, mergeErr = tx.ExecContext(ctx, "CALL DOLT_MERGE(?)", remoteBranch)
+	t.Logf("merge result: %v", mergeErr)
+	_ = tx.QueryRowContext(ctx, "SELECT COALESCE(SUM(num_violations),0) FROM dolt_constraint_violations").Scan(&nViol)
+	t.Logf("constraint violations after merge: %d", nViol)
+	return tx, remoteBranch, mergeErr, nViol
+}
+
+// TestPullAutoResolveFKViolationsEvents verifies the re-insert safe path on the
+// events child table (not just labels): OURS deletes issue E, THEIRS adds an
+// event for still-live E → FK violation on events → parent re-inserted, event
+// survives.
+func TestPullAutoResolveFKViolationsEvents(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+	db := store.db
+
+	tx, remoteBranch, mergeErr, nViol := fkMergeViolation(t, store, ctx, "fk-evt-e",
+		"INSERT INTO events (issue_id, event_type, actor) VALUES ('fk-evt-e', 'commented', 'tester')")
+	if nViol == 0 {
+		_ = tx.Rollback()
+		t.Skip("merge produced no FK constraint violations on this Dolt version")
+	}
+
+	resolved, resolveErr := store.tryAutoResolveFKConstraintViolationsWithRef(ctx, tx, remoteBranch)
+	if resolveErr != nil {
+		_ = tx.Rollback()
+		t.Fatalf("resolve error: %v (mergeErr: %v)", resolveErr, mergeErr)
+	}
+	if !resolved {
+		_ = tx.Rollback()
+		t.Fatalf("events FK violation not auto-resolved (mergeErr: %v)", mergeErr)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit after resolve: %v", err)
+	}
+
+	var issueCount, eventCount int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM issues WHERE id = 'fk-evt-e'").Scan(&issueCount); err != nil {
+		t.Fatalf("count issue: %v", err)
+	}
+	if issueCount != 1 {
+		t.Errorf("expected issue E re-inserted (1), got %d", issueCount)
+	}
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM events WHERE issue_id = 'fk-evt-e'").Scan(&eventCount); err != nil {
+		t.Fatalf("count event: %v", err)
+	}
+	if eventCount != 1 {
+		t.Errorf("expected event on E to survive (1), got %d", eventCount)
+	}
+}
+
+// TestPullAutoResolveFKViolationsUnknownTableSurfaces verifies the "surface,
+// never guess" contract at the table-allowlist gate: when a constraint violation
+// exists on a table that is NOT a known issue-child table, the resolver returns
+// (false, nil) so pullWithAutoResolve falls back to the original error path
+// rather than touching data it does not understand.
+//
+// child_counters has FOREIGN KEY (parent_id) REFERENCES issues(id) ON DELETE
+// CASCADE but is intentionally OUTSIDE issueChildTables (L2 scope). A merge that
+// deletes the parent on OURS while THEIRS adds a counter row leaves a violation
+// on child_counters, which must NOT be auto-resolved.
+func TestPullAutoResolveFKViolationsUnknownTableSurfaces(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+	db := store.db
+
+	// Require child_counters with the parent_id FK (migration 0008).
+	var hasTable int
+	_ = db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'child_counters'").Scan(&hasTable)
+	if hasTable == 0 {
+		t.Skip("child_counters table not present")
+	}
+
+	var currentBranch string
+	if err := db.QueryRowContext(ctx, "SELECT active_branch()").Scan(&currentBranch); err != nil {
+		t.Fatalf("get current branch: %v", err)
+	}
+
+	if _, err := db.ExecContext(ctx,
+		"INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type) VALUES ('fk-cc-p', 'P', '', '', '', '', 'open', 2, 'task')"); err != nil {
+		t.Fatalf("insert base issue: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'base: P')"); err != nil {
+		t.Fatalf("commit base: %v", err)
+	}
+
+	remoteBranch := currentBranch + "_ccr"
+	if _, err := db.ExecContext(ctx, "CALL DOLT_BRANCH(?, 'HEAD')", remoteBranch); err != nil {
+		t.Fatalf("create remote branch: %v", err)
+	}
+	defer func() {
+		db.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", currentBranch)
+		db.ExecContext(ctx, "CALL DOLT_BRANCH('-D', ?)", remoteBranch)
+	}()
+
+	if _, err := db.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", remoteBranch); err != nil {
+		t.Fatalf("checkout remote: %v", err)
+	}
+	// Insert a child_counters row referencing P. Use a permissive column set;
+	// fall back to skipping if the schema differs.
+	if _, err := db.ExecContext(ctx, "INSERT INTO child_counters (parent_id) VALUES ('fk-cc-p')"); err != nil {
+		t.Skipf("could not insert child_counters row (schema differs): %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'theirs: counter for P')"); err != nil {
+		t.Fatalf("commit theirs: %v", err)
+	}
+
+	if _, err := db.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", currentBranch); err != nil {
+		t.Fatalf("checkout current: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "DELETE FROM issues WHERE id = 'fk-cc-p'"); err != nil {
+		t.Fatalf("delete P on current: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'ours: delete P')"); err != nil {
+		t.Fatalf("commit ours: %v", err)
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx, "SET @@dolt_allow_commit_conflicts = 1"); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("set allow_commit_conflicts: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx, "SET @@dolt_force_transaction_commit = 1"); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("set force_transaction_commit: %v", err)
+	}
+	_, mergeErr := tx.ExecContext(ctx, "CALL DOLT_MERGE(?)", remoteBranch)
+	t.Logf("merge result: %v", mergeErr)
+	defer tx.Rollback()
+
+	var nViol int
+	var hasCCViol int
+	_ = tx.QueryRowContext(ctx, "SELECT COALESCE(SUM(num_violations),0) FROM dolt_constraint_violations").Scan(&nViol)
+	_ = tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM dolt_constraint_violations WHERE `table` = 'child_counters'").Scan(&hasCCViol)
+	t.Logf("constraint violations after merge: %d (child_counters rows: %d)", nViol, hasCCViol)
+	if nViol == 0 || hasCCViol == 0 {
+		t.Skip("merge produced no child_counters FK violation on this Dolt version")
+	}
+
+	// An unknown violating table must cause (false, nil) — surfaced, not resolved.
+	resolved, resolveErr := store.tryAutoResolveFKConstraintViolationsWithRef(ctx, tx, remoteBranch)
+	if resolveErr != nil {
+		t.Fatalf("expected (false,nil) for unknown table, got error: %v", resolveErr)
+	}
+	if resolved {
+		t.Errorf("expected unknown-table violation NOT to be auto-resolved (got resolved=true)")
+	}
+}
+
+// TestPullAutoResolveFKViolationsDependencies exercises the dependencies table,
+// which has TWO issue-referencing FK columns (issue_id and depends_on_issue_id).
+// OURS deletes issue P; THEIRS adds a dependency whose depends_on_issue_id
+// references still-live P → FK violation on dependencies.depends_on_issue_id →
+// P re-inserted, the dependency survives.
+func TestPullAutoResolveFKViolationsDependencies(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	ctx, cancel := testContext(t)
+	defer cancel()
+	db := store.db
+
+	// Require the split-dependencies schema (migration 0041+).
+	var hasCol int
+	_ = db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'dependencies' AND COLUMN_NAME = 'depends_on_issue_id'").Scan(&hasCol)
+	if hasCol == 0 {
+		t.Skip("dependencies.depends_on_issue_id not present (pre-0041 schema)")
+	}
+
+	var currentBranch string
+	if err := db.QueryRowContext(ctx, "SELECT active_branch()").Scan(&currentBranch); err != nil {
+		t.Fatalf("get current branch: %v", err)
+	}
+
+	// Base: parent P and source S both exist (S is the dependency's issue_id,
+	// P is the depends_on target). Only P is deleted on OURS to isolate the
+	// depends_on_issue_id FK column.
+	if _, err := db.ExecContext(ctx,
+		"INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type) VALUES ('fk-dep-p', 'P', '', '', '', '', 'open', 2, 'task'), ('fk-dep-s', 'S', '', '', '', '', 'open', 2, 'task')"); err != nil {
+		t.Fatalf("insert base issues: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'base: P and S')"); err != nil {
+		t.Fatalf("commit base: %v", err)
+	}
+
+	remoteBranch := currentBranch + "_depr"
+	if _, err := db.ExecContext(ctx, "CALL DOLT_BRANCH(?, 'HEAD')", remoteBranch); err != nil {
+		t.Fatalf("create remote branch: %v", err)
+	}
+	defer func() {
+		db.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", currentBranch)
+		db.ExecContext(ctx, "CALL DOLT_BRANCH('-D', ?)", remoteBranch)
+	}()
+
+	if _, err := db.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", remoteBranch); err != nil {
+		t.Fatalf("checkout remote: %v", err)
+	}
+	// S depends on P (depends_on_issue_id = P). depends_on_id is generated.
+	if _, err := db.ExecContext(ctx,
+		"INSERT INTO dependencies (issue_id, depends_on_issue_id, type, created_by) VALUES ('fk-dep-s', 'fk-dep-p', 'blocks', 'tester')"); err != nil {
+		t.Fatalf("insert dependency on remote branch: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'theirs: S depends on P')"); err != nil {
+		t.Fatalf("commit theirs: %v", err)
+	}
+
+	if _, err := db.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", currentBranch); err != nil {
+		t.Fatalf("checkout current: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "DELETE FROM issues WHERE id = 'fk-dep-p'"); err != nil {
+		t.Fatalf("delete P on current: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'ours: delete P')"); err != nil {
+		t.Fatalf("commit ours: %v", err)
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx, "SET @@dolt_allow_commit_conflicts = 1"); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("set allow_commit_conflicts: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx, "SET @@dolt_force_transaction_commit = 1"); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("set force_transaction_commit: %v", err)
+	}
+	_, mergeErr := tx.ExecContext(ctx, "CALL DOLT_MERGE(?)", remoteBranch)
+	t.Logf("merge result: %v", mergeErr)
+	var nViol int
+	_ = tx.QueryRowContext(ctx, "SELECT COALESCE(SUM(num_violations),0) FROM dolt_constraint_violations").Scan(&nViol)
+	t.Logf("constraint violations after merge: %d", nViol)
+	if nViol == 0 {
+		_ = tx.Rollback()
+		t.Skip("merge produced no FK constraint violations on this Dolt version")
+	}
+
+	resolved, resolveErr := store.tryAutoResolveFKConstraintViolationsWithRef(ctx, tx, remoteBranch)
+	if resolveErr != nil {
+		_ = tx.Rollback()
+		t.Fatalf("resolve error: %v (mergeErr: %v)", resolveErr, mergeErr)
+	}
+	if !resolved {
+		_ = tx.Rollback()
+		t.Fatalf("dependencies FK violation not auto-resolved (mergeErr: %v)", mergeErr)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit after resolve: %v", err)
+	}
+
+	// P must be re-inserted, and the dependency row must survive.
+	var pCount, depCount int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM issues WHERE id = 'fk-dep-p'").Scan(&pCount); err != nil {
+		t.Fatalf("count P: %v", err)
+	}
+	if pCount != 1 {
+		t.Errorf("expected P re-inserted (1), got %d", pCount)
+	}
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM dependencies WHERE issue_id = 'fk-dep-s' AND depends_on_issue_id = 'fk-dep-p'").Scan(&depCount); err != nil {
+		t.Fatalf("count dependency: %v", err)
+	}
+	if depCount != 1 {
+		t.Errorf("expected dependency to survive (1), got %d", depCount)
 	}
 }
 

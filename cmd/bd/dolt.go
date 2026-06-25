@@ -1287,6 +1287,7 @@ func init() {
 	doltCommitCmd.Flags().StringP("message", "m", "", "Commit message (default: auto-generated)")
 	doltCleanDatabasesCmd.Flags().Bool("dry-run", false, "Show what would be dropped without dropping")
 	doltRemoteRemoveCmd.Flags().Bool("force", false, "Force remove even when SQL and CLI URLs conflict")
+	doltConflictsListCmd.Flags().Bool("json", false, "Output conflicts as JSON")
 	doltRemoteCmd.AddCommand(doltRemoteAddCmd)
 	doltRemoteCmd.AddCommand(doltRemoteListCmd)
 	doltRemoteCmd.AddCommand(doltRemoteRemoveCmd)
@@ -1302,6 +1303,8 @@ func init() {
 	doltCmd.AddCommand(doltKillallCmd)
 	doltCmd.AddCommand(doltCleanDatabasesCmd)
 	doltCmd.AddCommand(doltRemoteCmd)
+	doltConflictsCmd.AddCommand(doltConflictsListCmd)
+	doltCmd.AddCommand(doltConflictsCmd)
 	rootCmd.AddCommand(doltCmd)
 }
 

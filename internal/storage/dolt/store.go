@@ -1278,9 +1278,11 @@ func buildServerDSN(cfg *Config, database string) string {
 	return parsed.FormatDSN()
 }
 
-// execWithLongTimeout opens a one-shot database connection with readTimeout=5m
-// and executes the given query. Push/pull operations can exceed the default
-// readTimeout when the server performs network I/O to git remotes.
+// execWithLongTimeout opens a one-shot database connection with a long read
+// deadline (doltSyncReadTimeout — default 30m, configurable via
+// BEADS_DOLT_PUSH_TIMEOUT) and executes the given query. Push/pull operations can
+// exceed the default 10s pool readTimeout when the server performs network I/O to
+// git remotes.
 //
 // The query is wrapped in an explicit transaction (BEGIN/COMMIT) so that
 // DOLT_PULL merge operations succeed even when the server runs with
@@ -1291,7 +1293,7 @@ func (s *DoltStore) execWithLongTimeout(ctx context.Context, query string, args 
 	if err != nil {
 		return fmt.Errorf("failed to parse DSN for long-timeout connection: %w", err)
 	}
-	cfg.ReadTimeout = 5 * time.Minute
+	cfg.ReadTimeout = doltSyncReadTimeout()
 	db, err := sql.Open("mysql", cfg.FormatDSN())
 	if err != nil {
 		return fmt.Errorf("failed to open long-timeout connection: %w", err)
@@ -1318,7 +1320,7 @@ func (s *DoltStore) execWithLongTimeoutNoTx(ctx context.Context, query string, a
 	if err != nil {
 		return fmt.Errorf("failed to parse DSN for long-timeout connection: %w", err)
 	}
-	cfg.ReadTimeout = 5 * time.Minute
+	cfg.ReadTimeout = doltSyncReadTimeout()
 	db, err := sql.Open("mysql", cfg.FormatDSN())
 	if err != nil {
 		return fmt.Errorf("failed to open long-timeout connection: %w", err)
@@ -1327,6 +1329,30 @@ func (s *DoltStore) execWithLongTimeoutNoTx(ctx context.Context, query string, a
 	db.SetMaxOpenConns(1)
 	_, err = db.ExecContext(ctx, query, args...)
 	return err
+}
+
+// doltSyncReadTimeout returns the MySQL client read-deadline applied to the
+// one-shot connections that run CALL DOLT_PUSH / DOLT_PULL. These commands block
+// while the dolt sql-server streams the delta to the git+ssh remote, emitting no
+// intermediate packets — so a fixed read deadline shorter than the upload aborts
+// an otherwise-healthy push (be-6ebm0: the `po` store took 5m08s and tripped the
+// previous hardcoded 5m deadline, leaving the remote head un-advanced).
+//
+// Override with BEADS_DOLT_PUSH_TIMEOUT (Go duration, e.g. "45m"); it governs
+// BOTH push and pull long-timeout connections. A value that parses to zero
+// ("0", "0s") disables the deadline entirely (unbounded — rely on context /
+// SIGINT for cancellation). An unparseable value is ignored and the default used.
+func doltSyncReadTimeout() time.Duration {
+	const def = 30 * time.Minute
+	raw := strings.TrimSpace(os.Getenv("BEADS_DOLT_PUSH_TIMEOUT"))
+	if raw == "" {
+		return def
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return def
+	}
+	return d // d == 0 → go-sql-driver treats as "no read timeout"
 }
 
 // applyPoolLimits configures the pool on db using the sensible-default
@@ -2287,7 +2313,7 @@ func (s *DoltStore) pullWithAutoResolve(ctx context.Context, query string, args 
 	if err != nil {
 		return fmt.Errorf("failed to parse DSN for long-timeout connection: %w", err)
 	}
-	cfg.ReadTimeout = 5 * time.Minute
+	cfg.ReadTimeout = doltSyncReadTimeout()
 	db, err := sql.Open("mysql", cfg.FormatDSN())
 	if err != nil {
 		return fmt.Errorf("failed to open long-timeout connection: %w", err)

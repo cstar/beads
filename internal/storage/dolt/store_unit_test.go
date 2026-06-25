@@ -469,9 +469,11 @@ func TestBuildServerDSN_WithoutSocket(t *testing.T) {
 	}
 }
 
-// TestExecWithLongTimeoutDSNRewrite verifies that execWithLongTimeout's
-// ParseDSN/FormatDSN rewrite produces a valid DSN with readTimeout=5m
-// given a DSN from buildServerDSN.
+// TestExecWithLongTimeoutDSNRewrite verifies that the sync (push/pull) long-timeout
+// connections rewrite buildServerDSN's DSN to carry doltSyncReadTimeout() — the
+// configurable deadline — rather than a hardcoded constant. Setting
+// BEADS_DOLT_PUSH_TIMEOUT must flow into the rewritten DSN, and the value must
+// never be the former hardcoded 5m that aborted the po-store push (be-6ebm0).
 func TestExecWithLongTimeoutDSNRewrite(t *testing.T) {
 	cfg := &Config{
 		ServerUser: "root",
@@ -483,20 +485,61 @@ func TestExecWithLongTimeoutDSNRewrite(t *testing.T) {
 
 	original := buildServerDSN(cfg, cfg.Database)
 
-	// Simulate the same rewrite that execWithLongTimeout performs.
+	// An explicit override must flow through the rewrite — proving the sync
+	// connections read doltSyncReadTimeout(), not a hardcoded constant.
+	t.Setenv("BEADS_DOLT_PUSH_TIMEOUT", "42m")
+
+	// Simulate the same rewrite that the sync connections perform.
 	parsed, err := mysql.ParseDSN(original)
 	if err != nil {
 		t.Fatalf("failed to parse original DSN: %v", err)
 	}
-	parsed.ReadTimeout = 5 * time.Minute
+	parsed.ReadTimeout = doltSyncReadTimeout()
 	rewritten := parsed.FormatDSN()
 
 	reParsed, err := mysql.ParseDSN(rewritten)
 	if err != nil {
 		t.Fatalf("failed to parse rewritten DSN: %v", err)
 	}
-	if reParsed.ReadTimeout != 5*time.Minute {
-		t.Errorf("expected readTimeout=5m, got %v", reParsed.ReadTimeout)
+	if want := 42 * time.Minute; reParsed.ReadTimeout != want {
+		t.Errorf("expected sync readTimeout to follow BEADS_DOLT_PUSH_TIMEOUT=%v, got %v", want, reParsed.ReadTimeout)
+	}
+	if reParsed.ReadTimeout == 5*time.Minute {
+		t.Errorf("sync readTimeout must not be the former hardcoded 5m (be-6ebm0 regression)")
+	}
+}
+
+// TestDoltSyncReadTimeout verifies the configurable client read deadline applied
+// to the one-shot CALL DOLT_PUSH / DOLT_PULL connections (be-6ebm0). It defaults
+// to 30m when unset, honours a valid Go duration override, treats "0" as "no
+// deadline" (go-sql-driver semantics), and falls back to the default on an
+// unparseable value. Pure env parsing — no Dolt server required.
+func TestDoltSyncReadTimeout(t *testing.T) {
+	const envKey = "BEADS_DOLT_PUSH_TIMEOUT"
+	tests := []struct {
+		name string
+		set  bool
+		env  string
+		want time.Duration
+	}{
+		{"default when unset", false, "", 30 * time.Minute},
+		{"explicit 45m override", true, "45m", 45 * time.Minute},
+		{"zero disables deadline", true, "0", 0},
+		{"invalid falls back to default", true, "not-a-duration", 30 * time.Minute},
+		{"whitespace trimmed", true, "  20m  ", 20 * time.Minute},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// t.Setenv snapshots the original value and restores it on cleanup,
+			// so it is safe to Unsetenv afterwards for the "unset" case.
+			t.Setenv(envKey, tt.env)
+			if !tt.set {
+				os.Unsetenv(envKey)
+			}
+			if got := doltSyncReadTimeout(); got != tt.want {
+				t.Errorf("doltSyncReadTimeout() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 

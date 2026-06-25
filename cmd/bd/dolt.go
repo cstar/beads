@@ -347,6 +347,8 @@ The remote must already exist (see 'bd dolt remote add').`,
 					fmt.Fprintln(os.Stderr, "Use 'bd dolt remote list' to see configured remotes.")
 				} else if isDivergedHistoryErr(err) {
 					printDivergedHistoryGuidance("pull")
+				} else if isConflictsRemainErr(err) || isInConflictErr(err) {
+					printConflictResolutionGuidance()
 				}
 				os.Exit(1)
 			}
@@ -362,6 +364,8 @@ The remote must already exist (see 'bd dolt remote add').`,
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			if isDivergedHistoryErr(err) {
 				printDivergedHistoryGuidance("pull")
+			} else if isConflictsRemainErr(err) || isInConflictErr(err) {
+				printConflictResolutionGuidance()
 			}
 			os.Exit(1)
 		}

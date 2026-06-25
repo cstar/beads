@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -11,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 )
 
 // doltConflictsCmd is the parent for inspecting and resolving merge conflicts
@@ -196,4 +198,35 @@ the wedged state so writes succeed again. Use --json for machine-readable output
 		}
 		fmt.Println(out)
 	},
+}
+
+// isConflictsRemainErr reports whether err is (or wraps) a *ConflictsRemainError —
+// i.e. a pull that surfaced conflicts the auto-resolvers could not handle.
+func isConflictsRemainErr(err error) bool {
+	var cre *dolt.ConflictsRemainError
+	return errors.As(err, &cre)
+}
+
+// isInConflictErr reports whether err is the pre-pull/pre-write "table(s) ... are
+// in conflict" failure that a store wedged by an earlier unresolved merge raises
+// (store.go auto-commit-before-pull). Matched by message because Dolt surfaces it
+// as a plain error.
+func isInConflictErr(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "in conflict")
+}
+
+// printConflictResolutionGuidance tells the operator how to recover a store that a
+// pull left with unresolved conflicts, pointing at the bd dolt conflicts surface
+// (never raw CALL DOLT_CONFLICTS_RESOLVE against the live server).
+func printConflictResolutionGuidance() {
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "The pull left merge conflicts in the working set; the store is wedged")
+	fmt.Fprintln(os.Stderr, "until they are resolved (further writes will fail with 'in conflict').")
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "Inspect and resolve them:")
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "  bd dolt conflicts list                     # conflicted tables + counts")
+	fmt.Fprintln(os.Stderr, "  bd dolt conflicts resolve --theirs         # take the remote side (all tables)")
+	fmt.Fprintln(os.Stderr, "  bd dolt conflicts resolve --ours <table>   # keep our side for one table")
+	fmt.Fprintln(os.Stderr, "")
 }

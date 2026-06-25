@@ -2,11 +2,14 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 )
 
 // findSubcommand returns the child of parent whose Name() == name, or nil.
@@ -104,6 +107,46 @@ func TestDoltConflictsResolveFlags(t *testing.T) {
 		}
 		if s, err := resolveStrategy(false, true); err != nil || s != "theirs" {
 			t.Errorf("--theirs: got (%q, %v), want (\"theirs\", nil)", s, err)
+		}
+	})
+}
+
+// TestDoltPull_ConflictGuidance verifies that a pull leaving conflicts is
+// classified and surfaced with actionable guidance (and never reports success):
+//   - isConflictsRemainErr detects a (wrapped) *ConflictsRemainError from the store,
+//   - isInConflictErr detects the pre-pull "table(s) ... are in conflict" wedge,
+//   - printConflictResolutionGuidance points the operator at `bd dolt conflicts`.
+// The doltPullCmd error branches wire these together; because the store now returns
+// a non-nil error on unresolved conflicts (T-004), "Pull complete." is never reached.
+func TestDoltPull_ConflictGuidance(t *testing.T) {
+	t.Run("ClassifyConflictsRemain", func(t *testing.T) {
+		base := &dolt.ConflictsRemainError{Counts: map[string]int{"issues": 2}}
+		wrapped := fmt.Errorf("failed to pull from origin/main: %w", base)
+		if !isConflictsRemainErr(wrapped) {
+			t.Error("expected isConflictsRemainErr=true for a wrapped *ConflictsRemainError")
+		}
+		if isConflictsRemainErr(errors.New("some unrelated error")) {
+			t.Error("expected isConflictsRemainErr=false for an unrelated error")
+		}
+		if isConflictsRemainErr(nil) {
+			t.Error("expected isConflictsRemainErr=false for nil")
+		}
+	})
+
+	t.Run("ClassifyInConflict", func(t *testing.T) {
+		wedge := errors.New("failed to commit pending changes before pull: table(s) issues are in conflict")
+		if !isInConflictErr(wedge) {
+			t.Error("expected isInConflictErr=true for the pre-pull wedge error")
+		}
+		if isInConflictErr(errors.New("connection refused")) {
+			t.Error("expected isInConflictErr=false for an unrelated error")
+		}
+	})
+
+	t.Run("GuidanceMentionsResolveCommand", func(t *testing.T) {
+		out := captureStderr(t, printConflictResolutionGuidance)
+		if !strings.Contains(out, "bd dolt conflicts resolve") {
+			t.Errorf("guidance should point at `bd dolt conflicts resolve`, got:\n%s", out)
 		}
 	})
 }

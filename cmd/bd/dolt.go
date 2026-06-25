@@ -54,6 +54,10 @@ Remote management:
   bd dolt remote list                List configured remotes
   bd dolt remote remove <name>       Remove a Dolt remote
 
+Conflict resolution:
+  bd dolt conflicts list                       Show tables with merge conflicts
+  bd dolt conflicts resolve --ours|--theirs    Resolve conflicts (and commit)
+
 Configuration keys for 'bd dolt set':
   database  Database name (default: issue prefix or "beads")
   host      Server host (default: 127.0.0.1)

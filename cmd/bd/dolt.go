@@ -54,6 +54,10 @@ Remote management:
   bd dolt remote list                List configured remotes
   bd dolt remote remove <name>       Remove a Dolt remote
 
+Conflict resolution:
+  bd dolt conflicts list                       Show tables with merge conflicts
+  bd dolt conflicts resolve --ours|--theirs    Resolve conflicts (and commit)
+
 Configuration keys for 'bd dolt set':
   database  Database name (default: issue prefix or "beads")
   host      Server host (default: 127.0.0.1)
@@ -347,6 +351,8 @@ The remote must already exist (see 'bd dolt remote add').`,
 					fmt.Fprintln(os.Stderr, "Use 'bd dolt remote list' to see configured remotes.")
 				} else if isDivergedHistoryErr(err) {
 					printDivergedHistoryGuidance("pull")
+				} else if isConflictsRemainErr(err) || isInConflictErr(err) {
+					printConflictResolutionGuidance()
 				}
 				os.Exit(1)
 			}
@@ -362,6 +368,8 @@ The remote must already exist (see 'bd dolt remote add').`,
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			if isDivergedHistoryErr(err) {
 				printDivergedHistoryGuidance("pull")
+			} else if isConflictsRemainErr(err) || isInConflictErr(err) {
+				printConflictResolutionGuidance()
 			}
 			os.Exit(1)
 		}
@@ -1287,6 +1295,10 @@ func init() {
 	doltCommitCmd.Flags().StringP("message", "m", "", "Commit message (default: auto-generated)")
 	doltCleanDatabasesCmd.Flags().Bool("dry-run", false, "Show what would be dropped without dropping")
 	doltRemoteRemoveCmd.Flags().Bool("force", false, "Force remove even when SQL and CLI URLs conflict")
+	doltConflictsListCmd.Flags().Bool("json", false, "Output conflicts as JSON")
+	doltConflictsResolveCmd.Flags().Bool("ours", false, "Resolve conflicts keeping our side")
+	doltConflictsResolveCmd.Flags().Bool("theirs", false, "Resolve conflicts keeping their side")
+	doltConflictsResolveCmd.Flags().Bool("json", false, "Output the resolution result as JSON")
 	doltRemoteCmd.AddCommand(doltRemoteAddCmd)
 	doltRemoteCmd.AddCommand(doltRemoteListCmd)
 	doltRemoteCmd.AddCommand(doltRemoteRemoveCmd)
@@ -1302,6 +1314,9 @@ func init() {
 	doltCmd.AddCommand(doltKillallCmd)
 	doltCmd.AddCommand(doltCleanDatabasesCmd)
 	doltCmd.AddCommand(doltRemoteCmd)
+	doltConflictsCmd.AddCommand(doltConflictsListCmd)
+	doltConflictsCmd.AddCommand(doltConflictsResolveCmd)
+	doltCmd.AddCommand(doltConflictsCmd)
 	rootCmd.AddCommand(doltCmd)
 }
 

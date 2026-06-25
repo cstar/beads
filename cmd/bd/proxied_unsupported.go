@@ -20,6 +20,9 @@ const (
 	CapabilityDoltPull Capability = "dolt-pull"
 	// CapabilityDoltCommit is `bd dolt commit` and other raw history writes.
 	CapabilityDoltCommit Capability = "dolt-commit"
+	// CapabilityDoltConflicts is `bd dolt conflicts list|resolve` — inspecting and
+	// resolving merge conflicts in the working set via raw DOLT_CONFLICTS_RESOLVE.
+	CapabilityDoltConflicts Capability = "dolt-conflicts"
 	// CapabilityCompaction is `bd compact` — rewriting Dolt history requires
 	// exclusive direct access to the underlying repository.
 	CapabilityCompaction Capability = "compaction"

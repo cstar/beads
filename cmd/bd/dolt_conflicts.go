@@ -1,0 +1,252 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"sort"
+	"strings"
+
+	"github.com/spf13/cobra"
+
+	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/dolt"
+)
+
+// doltConflictsCmd is the parent for inspecting and resolving merge conflicts
+// left in the Dolt working set (e.g. after a pull that surfaced a non-metadata
+// data conflict). It is the first-class surface that replaces dropping to raw
+// CALL DOLT_CONFLICTS_RESOLVE against the live server.
+var doltConflictsCmd = &cobra.Command{
+	Use:   "conflicts",
+	Short: "Inspect and resolve Dolt merge conflicts",
+	Long: `Inspect and resolve merge conflicts sitting in the Dolt working set.
+
+A pull/merge that leaves a data conflict (e.g. on the issues table) wedges the
+store: every subsequent write fails with "table(s) ... are in conflict". These
+commands surface the conflicts and resolve them without dropping to raw SQL.
+
+Subcommands:
+  list                          Show per-table conflict counts
+  resolve --ours|--theirs [t]   Resolve (and commit) conflicts, all tables or one`,
+}
+
+var doltConflictsListCmd = &cobra.Command{
+	Use:   "list",
+	Short: "List tables with unresolved merge conflicts",
+	Long: `List each table that has unresolved merge conflicts in the working set,
+with its conflicting-row count. Prints "No conflicts." when the working set is
+clean. Use --json for machine-readable output.`,
+	Run: func(cmd *cobra.Command, args []string) {
+		ctx := context.Background()
+		st := storeForRawDoltSync(ctx, CapabilityDoltConflicts)
+		if st == nil {
+			fmt.Fprintf(os.Stderr, "Error: no store available\n")
+			os.Exit(1)
+		}
+		conflicts, err := st.GetConflicts(ctx)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		asJSON, _ := cmd.Flags().GetBool("json")
+		out, err := formatConflictsList(conflicts, asJSON)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(out)
+	},
+}
+
+// formatConflictsList renders per-table conflict counts. Output is deterministic
+// (sorted by table name). With asJSON it returns a JSON array of {table,count};
+// otherwise a tab-separated table, or "No conflicts." when there are none.
+func formatConflictsList(conflicts []storage.Conflict, asJSON bool) (string, error) {
+	sorted := make([]storage.Conflict, len(conflicts))
+	copy(sorted, conflicts)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Field < sorted[j].Field })
+
+	if asJSON {
+		type entry struct {
+			Table string `json:"table"`
+			Count int    `json:"count"`
+		}
+		entries := make([]entry, 0, len(sorted))
+		for _, c := range sorted {
+			entries = append(entries, entry{Table: c.Field, Count: c.Count})
+		}
+		b, err := json.MarshalIndent(entries, "", "  ")
+		if err != nil {
+			return "", fmt.Errorf("marshal conflicts: %w", err)
+		}
+		return string(b), nil
+	}
+
+	if len(sorted) == 0 {
+		return "No conflicts.", nil
+	}
+	var sb strings.Builder
+	sb.WriteString("TABLE\tCONFLICTS")
+	for _, c := range sorted {
+		sb.WriteString(fmt.Sprintf("\n%s\t%d", c.Field, c.Count))
+	}
+	return sb.String(), nil
+}
+
+// resolveStrategy validates the mutually-exclusive --ours/--theirs flags and
+// returns the Dolt strategy name. Exactly one must be set.
+func resolveStrategy(ours, theirs bool) (string, error) {
+	switch {
+	case ours && theirs:
+		return "", fmt.Errorf("--ours and --theirs are mutually exclusive")
+	case ours:
+		return "ours", nil
+	case theirs:
+		return "theirs", nil
+	default:
+		return "", fmt.Errorf("one of --ours or --theirs is required")
+	}
+}
+
+// formatResolveResult renders the outcome of a resolve. With asJSON it returns a
+// JSON object {strategy, resolved:[...tables]}; otherwise a one-line summary, or a
+// no-op message when there was nothing to resolve.
+func formatResolveResult(tables []string, strategy string, asJSON bool) (string, error) {
+	if asJSON {
+		b, err := json.MarshalIndent(map[string]any{
+			"strategy": strategy,
+			"resolved": tables,
+		}, "", "  ")
+		if err != nil {
+			return "", fmt.Errorf("marshal resolve result: %w", err)
+		}
+		return string(b), nil
+	}
+	if len(tables) == 0 {
+		return "No conflicts to resolve.", nil
+	}
+	return fmt.Sprintf("Resolved %d table(s) with --%s: %s", len(tables), strategy, strings.Join(tables, ", ")), nil
+}
+
+// conflictResolver is the minimal store surface `bd dolt conflicts resolve`
+// drives. Extracted so the resolve wiring (table selection, per-table resolve,
+// commit) is unit-testable without a live Dolt store; storage.DoltStorage (the
+// concrete type returned by storeForRawDoltSync) satisfies it.
+type conflictResolver interface {
+	GetConflicts(ctx context.Context) ([]storage.Conflict, error)
+	ResolveConflicts(ctx context.Context, table, strategy string) error
+	Commit(ctx context.Context, message string) error
+}
+
+// resolveConflictsCore selects the target tables (the explicit [table] arg, or
+// every currently-conflicted table when table is empty), resolves each with the
+// given strategy, then commits once. Returns the resolved tables — nil when there
+// was nothing to resolve, in which case no commit is issued.
+func resolveConflictsCore(ctx context.Context, st conflictResolver, table, strategy string) ([]string, error) {
+	var tables []string
+	if table != "" {
+		tables = []string{table}
+	} else {
+		conflicts, err := st.GetConflicts(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, c := range conflicts {
+			tables = append(tables, c.Field)
+		}
+	}
+	if len(tables) == 0 {
+		return nil, nil
+	}
+	for _, tbl := range tables {
+		if err := st.ResolveConflicts(ctx, tbl, strategy); err != nil {
+			return nil, fmt.Errorf("resolving %s: %w", tbl, err)
+		}
+	}
+	msg := fmt.Sprintf("bd dolt conflicts resolve --%s (%s)", strategy, strings.Join(tables, ", "))
+	if err := st.Commit(ctx, msg); err != nil {
+		return nil, fmt.Errorf("committing resolution: %w", err)
+	}
+	return tables, nil
+}
+
+var doltConflictsResolveCmd = &cobra.Command{
+	Use:   "resolve [table]",
+	Short: "Resolve merge conflicts with --ours or --theirs (and commit)",
+	Long: `Resolve merge conflicts in the working set and commit the resolution.
+
+Exactly one of --ours / --theirs selects which side wins. With a [table]
+argument only that table is resolved; with no argument every currently-conflicted
+table is resolved with the same strategy. The resolution is committed, clearing
+the wedged state so writes succeed again. Use --json for machine-readable output.`,
+	Args: cobra.MaximumNArgs(1),
+	Run: func(cmd *cobra.Command, args []string) {
+		ctx := context.Background()
+		ours, _ := cmd.Flags().GetBool("ours")
+		theirs, _ := cmd.Flags().GetBool("theirs")
+		strategy, err := resolveStrategy(ours, theirs)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		asJSON, _ := cmd.Flags().GetBool("json")
+
+		st := storeForRawDoltSync(ctx, CapabilityDoltConflicts)
+		if st == nil {
+			fmt.Fprintf(os.Stderr, "Error: no store available\n")
+			os.Exit(1)
+		}
+
+		// Target tables: the explicit arg, or every currently-conflicted table.
+		tableArg := ""
+		if len(args) == 1 {
+			tableArg = args[0]
+		}
+		tables, err := resolveConflictsCore(ctx, st, tableArg, strategy)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+		out, err := formatResolveResult(tables, strategy, asJSON)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(out)
+	},
+}
+
+// isConflictsRemainErr reports whether err is (or wraps) a *ConflictsRemainError —
+// i.e. a pull that surfaced conflicts the auto-resolvers could not handle.
+func isConflictsRemainErr(err error) bool {
+	var cre *dolt.ConflictsRemainError
+	return errors.As(err, &cre)
+}
+
+// isInConflictErr reports whether err is the pre-pull/pre-write "table(s) ... are
+// in conflict" failure that a store wedged by an earlier unresolved merge raises
+// (store.go auto-commit-before-pull). Matched by message because Dolt surfaces it
+// as a plain error.
+func isInConflictErr(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "in conflict")
+}
+
+// printConflictResolutionGuidance tells the operator how to recover a store that a
+// pull left with unresolved conflicts, pointing at the bd dolt conflicts surface
+// (never raw CALL DOLT_CONFLICTS_RESOLVE against the live server).
+func printConflictResolutionGuidance() {
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "The pull left merge conflicts in the working set; the store is wedged")
+	fmt.Fprintln(os.Stderr, "until they are resolved (further writes will fail with 'in conflict').")
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "Inspect and resolve them:")
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "  bd dolt conflicts list                     # conflicted tables + counts")
+	fmt.Fprintln(os.Stderr, "  bd dolt conflicts resolve --theirs         # take the remote side (all tables)")
+	fmt.Fprintln(os.Stderr, "  bd dolt conflicts resolve --ours <table>   # keep our side for one table")
+	fmt.Fprintln(os.Stderr, "")
+}

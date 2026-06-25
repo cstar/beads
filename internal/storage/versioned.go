@@ -26,9 +26,10 @@ type DiffEntry struct {
 // Conflict represents a merge conflict.
 type Conflict struct {
 	IssueID     string      // The ID of the conflicting issue
-	Field       string      // Which field has the conflict (empty for table-level)
+	Field       string      // Which field has the conflict (table name for table-level)
 	OursValue   interface{} // Value on current branch
 	TheirsValue interface{} // Value on merged branch
+	Count       int         // Number of conflicting rows for the table (dolt_conflicts.num_conflicts)
 }
 
 // RemoteInfo describes a configured remote.

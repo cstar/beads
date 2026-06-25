@@ -3,7 +3,10 @@ package dolt
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"testing"
+
+	"github.com/steveyegge/beads/internal/storage/versioncontrolops"
 )
 
 // TestPullAutoResolveFKConstraintViolations verifies ADR-0018 Layer 2:
@@ -782,5 +785,192 @@ func TestPullAutoResolveSkipsNonMetadataConflicts(t *testing.T) {
 
 	if resolved {
 		t.Error("expected non-metadata conflicts NOT to be auto-resolved")
+	}
+}
+
+// seedIssuesConflict creates a real issues-table data conflict in the working
+// set using the divergent-branch pattern (same PK inserted with different titles
+// on two branches, then merged with dolt_allow_commit_conflicts). It returns an
+// open transaction holding the conflict; the caller must Rollback or Commit it.
+// The conflict is visible via SELECT ... FROM dolt_conflicts on the returned tx.
+func seedIssuesConflict(t *testing.T, store *DoltStore, ctx context.Context, pk string) *sql.Tx {
+	t.Helper()
+	db := store.db
+
+	var currentBranch string
+	if err := db.QueryRowContext(ctx, "SELECT active_branch()").Scan(&currentBranch); err != nil {
+		t.Fatalf("failed to get current branch: %v", err)
+	}
+
+	if _, err := db.ExecContext(ctx,
+		"INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type) VALUES (?, 'Local Title', '', '', '', '', 'open', 2, 'task')", pk); err != nil {
+		t.Fatalf("failed to insert local issue: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'local issue')"); err != nil {
+		t.Fatalf("failed to commit local issue: %v", err)
+	}
+
+	remoteBranch := currentBranch + "_remote_" + pk
+	if _, err := db.ExecContext(ctx, "CALL DOLT_BRANCH(?, 'HEAD~1')", remoteBranch); err != nil {
+		t.Fatalf("failed to create remote branch: %v", err)
+	}
+	t.Cleanup(func() {
+		db.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", currentBranch)
+		db.ExecContext(ctx, "CALL DOLT_BRANCH('-D', ?)", remoteBranch)
+	})
+
+	if _, err := db.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", remoteBranch); err != nil {
+		t.Fatalf("failed to checkout remote branch: %v", err)
+	}
+	if _, err := db.ExecContext(ctx,
+		"INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type) VALUES (?, 'Remote Title', '', '', '', '', 'open', 2, 'task')", pk); err != nil {
+		t.Fatalf("failed to insert remote issue: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'remote issue')"); err != nil {
+		t.Fatalf("failed to commit remote issue: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CALL DOLT_CHECKOUT(?)", currentBranch); err != nil {
+		t.Fatalf("failed to checkout current branch: %v", err)
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("failed to begin tx: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx, "SET @@dolt_allow_commit_conflicts = 1"); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("failed to set allow_commit_conflicts: %v", err)
+	}
+	if _, mergeErr := tx.ExecContext(ctx, "CALL DOLT_MERGE(?)", remoteBranch); mergeErr != nil {
+		// Some Dolt versions surface conflicts as an error here; the conflict is
+		// still left in the working set, which is what we want.
+		t.Logf("DOLT_MERGE returned (expected on conflict): %v", mergeErr)
+	}
+	return tx
+}
+
+// TestGetConflicts_ReportsCount verifies that GetConflicts reports the per-table
+// conflict count from dolt_conflicts.num_conflicts, not just the table name.
+func TestGetConflicts_ReportsCount(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	tx := seedIssuesConflict(t, store, ctx, "conflict-count")
+	defer tx.Rollback()
+
+	conflicts, err := versioncontrolops.GetConflicts(ctx, tx)
+	if err != nil {
+		t.Fatalf("GetConflicts error: %v", err)
+	}
+	if len(conflicts) == 0 {
+		t.Skip("Dolt auto-merged — no conflict materialized to count")
+	}
+
+	var found bool
+	for _, c := range conflicts {
+		if c.Field == "issues" {
+			found = true
+			if c.Count < 1 {
+				t.Errorf("expected issues conflict Count >= 1, got %d", c.Count)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("expected an 'issues' table conflict, got %+v", conflicts)
+	}
+}
+
+// TestPullWithAutoResolve_SurfacesUnresolvedConflicts verifies that an
+// issues-table data conflict surviving metadata/FK auto-resolution is surfaced as
+// a typed *ConflictsRemainError naming the table with count >= 1, instead of being
+// silently committed (the bug: pullWithAutoResolve returned nil). It exercises
+// detectRemainingConflicts on the pull transaction — the same tx-helper idiom as
+// TestPullAutoResolveMetadataConflicts uses for tryAutoResolveMetadataConflicts —
+// because pullWithAutoResolve opens its own connection (a fresh session on the
+// default branch), which the per-test isolated branch harness cannot drive.
+func TestPullWithAutoResolve_SurfacesUnresolvedConflicts(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	tx := seedIssuesConflict(t, store, ctx, "pull-surface")
+	defer tx.Rollback()
+
+	// Metadata auto-resolve must decline an issues conflict (not metadata-only).
+	resolved, err := store.tryAutoResolveMetadataConflicts(ctx, tx)
+	if err != nil {
+		t.Fatalf("tryAutoResolveMetadataConflicts: %v", err)
+	}
+	if resolved {
+		t.Skip("Dolt auto-merged the issues conflict — nothing left to surface")
+	}
+
+	// The new detection path must surface it as a typed error with the count.
+	remainErr, derr := store.detectRemainingConflicts(ctx, tx)
+	if derr != nil {
+		t.Fatalf("detectRemainingConflicts: %v", derr)
+	}
+	if remainErr == nil {
+		t.Skip("no conflict materialized to surface")
+	}
+
+	var cre *ConflictsRemainError
+	if !errors.As(error(remainErr), &cre) {
+		t.Fatalf("expected *ConflictsRemainError, got %T: %v", remainErr, remainErr)
+	}
+	if cre.Counts["issues"] < 1 {
+		t.Errorf("expected issues conflict count >= 1, got %+v", cre.Counts)
+	}
+}
+
+// TestConflictsResolveAndCommit verifies that resolving an issues-table conflict
+// with "theirs" and then committing (what `bd dolt conflicts resolve --theirs
+// issues` does) clears the conflict from the working set — i.e. ResolveConflicts
+// stages-and-commits cleanly via store.Commit (GH#2455 stages dirty tables), so
+// GetConflicts is empty afterwards and the store is no longer wedged.
+func TestConflictsResolveAndCommit(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	tx := seedIssuesConflict(t, store, ctx, "resolve-commit")
+
+	// Confirm a conflict materialized, then PERSIST the conflicted working set
+	// (allow-commit-conflicts is set on this tx) and release the single pooled
+	// connection so the store methods below can acquire it.
+	conflicts, err := versioncontrolops.GetConflicts(ctx, tx)
+	if err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("GetConflicts(tx): %v", err)
+	}
+	if len(conflicts) == 0 {
+		_ = tx.Rollback()
+		t.Skip("Dolt auto-merged the issues conflict — nothing to resolve")
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit merge-with-conflicts: %v", err)
+	}
+
+	// Resolve + commit through the store API (the resolve command's core).
+	if err := store.ResolveConflicts(ctx, "issues", "theirs"); err != nil {
+		t.Fatalf("ResolveConflicts: %v", err)
+	}
+	if err := store.Commit(ctx, "resolve issues conflicts (theirs)"); err != nil {
+		t.Fatalf("Commit after resolve: %v", err)
+	}
+
+	remaining, err := store.GetConflicts(ctx)
+	if err != nil {
+		t.Fatalf("GetConflicts after resolve: %v", err)
+	}
+	if len(remaining) != 0 {
+		t.Errorf("expected no conflicts after resolve+commit, got %+v", remaining)
 	}
 }

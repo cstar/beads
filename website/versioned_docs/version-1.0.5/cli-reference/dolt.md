@@ -99,6 +99,59 @@ bd dolt commit [flags]
   -m, --message string   Commit message (default: auto-generated)
 ```
 
+### bd dolt conflicts
+
+Inspect and resolve merge conflicts sitting in the Dolt working set.
+
+A pull/merge that leaves a data conflict (e.g. on the issues table) wedges the
+store: every subsequent write fails with "table(s) ... are in conflict". These
+commands surface the conflicts and resolve them without dropping to raw SQL.
+
+Subcommands:
+  list                          Show per-table conflict counts
+  resolve --ours|--theirs [t]   Resolve (and commit) conflicts, all tables or one
+
+```
+bd dolt conflicts
+```
+
+#### bd dolt conflicts list
+
+List each table that has unresolved merge conflicts in the working set,
+with its conflicting-row count. Prints "No conflicts." when the working set is
+clean. Use --json for machine-readable output.
+
+```
+bd dolt conflicts list [flags]
+```
+
+**Flags:**
+
+```
+      --json   Output conflicts as JSON
+```
+
+#### bd dolt conflicts resolve
+
+Resolve merge conflicts in the working set and commit the resolution.
+
+Exactly one of --ours / --theirs selects which side wins. With a [table]
+argument only that table is resolved; with no argument every currently-conflicted
+table is resolved with the same strategy. The resolution is committed, clearing
+the wedged state so writes succeed again. Use --json for machine-readable output.
+
+```
+bd dolt conflicts resolve [table] [flags]
+```
+
+**Flags:**
+
+```
+      --json     Output the resolution result as JSON
+      --ours     Resolve conflicts keeping our side
+      --theirs   Resolve conflicts keeping their side
+```
+
 ### bd dolt killall
 
 Find and kill orphan dolt sql-server processes not tracked by the

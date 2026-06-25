@@ -152,3 +152,37 @@ No-op. This code is not in the voxmemo → voxist-api clinical pipeline; it is
 issue-tracker sync infrastructure. No chain-of-evidence metadata (microphone →
 exported clinical note) is involved. Heading retained per planner discipline so
 an auditor sees the explicit consideration.
+
+## Execution status (beads/voxist.executor)
+
+All 6 micro-tasks green and committed on `gc/be-6ebm0`.
+
+- [x] T-001/T-002 — `doltSyncReadTimeout()` helper + `TestDoltSyncReadTimeout` (unset→30m, 45m, 0, invalid→30m, whitespace)   ✅ green at bc20f14be
+- [x] T-003 — apply helper at the sync call sites   ✅ green at 4e27b7f0d
+- [x] T-004 — `TestExecWithLongTimeoutDSNRewrite` regression-lock (env override flows into DSN, never 5m)   ✅ green at 4e27b7f0d
+- [x] T-005 — document `BEADS_DOLT_PUSH_TIMEOUT` (CLI reference + CHANGELOG)   ✅ green at ad27a0243
+- [x] T-006 — package gate: `go vet ./internal/storage/dolt/...` clean; `go test` green in a clean env
+
+### Deviation from plan (T-003) — corrected premise
+
+The plan stated the **third** `cfg.ReadTimeout = 5 * time.Minute` was "the
+steady-state pool/default connection for normal queries — leave it untouched",
+and Open Question #4 asked the executor to confirm this. On inspection that third
+occurrence is **`pullWithAutoResolve`** — a `DOLT_PULL` sync path with the
+identical long-upload bug, not a normal-query pool default. The genuine
+steady-state pool default is `buildServerDSN`'s `parsed.ReadTimeout = 10 *
+time.Second` (untouched), and `openMigrationDB` stays unbounded (`= 0`,
+untouched). All **three** 5m sync sites (push + both pull paths) were therefore
+swapped to `doltSyncReadTimeout()` — which matches the helper's own contract
+("governs BOTH push and pull"). Net: `grep -c "ReadTimeout = 5 \* time.Minute"`
+is now **0** (not 1 as the plan's premise predicted); the real invariant "the
+normal-query pool deadline is unchanged" holds.
+
+### Local verification note (false-red)
+
+The `TestApplyConfigDefaults_*` port tests fail **only** inside a gc session
+because it exports `BEADS_DOLT_SERVER_PORT=42188` (the live managed dolt) and
+those pre-existing tests override only the legacy `BEADS_DOLT_PORT`, not the
+primary `BEADS_DOLT_SERVER_PORT`. With `BEADS_DOLT_SERVER_PORT` unset the whole
+package is green (`ok`); CI runs in a clean env. Unrelated to this change.
+Server-backed dolt tests skip locally (no Docker) and run in CI.

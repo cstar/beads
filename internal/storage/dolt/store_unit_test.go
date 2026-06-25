@@ -469,9 +469,11 @@ func TestBuildServerDSN_WithoutSocket(t *testing.T) {
 	}
 }
 
-// TestExecWithLongTimeoutDSNRewrite verifies that execWithLongTimeout's
-// ParseDSN/FormatDSN rewrite produces a valid DSN with readTimeout=5m
-// given a DSN from buildServerDSN.
+// TestExecWithLongTimeoutDSNRewrite verifies that the sync (push/pull) long-timeout
+// connections rewrite buildServerDSN's DSN to carry doltSyncReadTimeout() — the
+// configurable deadline — rather than a hardcoded constant. Setting
+// BEADS_DOLT_PUSH_TIMEOUT must flow into the rewritten DSN, and the value must
+// never be the former hardcoded 5m that aborted the po-store push (be-6ebm0).
 func TestExecWithLongTimeoutDSNRewrite(t *testing.T) {
 	cfg := &Config{
 		ServerUser: "root",
@@ -483,20 +485,27 @@ func TestExecWithLongTimeoutDSNRewrite(t *testing.T) {
 
 	original := buildServerDSN(cfg, cfg.Database)
 
-	// Simulate the same rewrite that execWithLongTimeout performs.
+	// An explicit override must flow through the rewrite — proving the sync
+	// connections read doltSyncReadTimeout(), not a hardcoded constant.
+	t.Setenv("BEADS_DOLT_PUSH_TIMEOUT", "42m")
+
+	// Simulate the same rewrite that the sync connections perform.
 	parsed, err := mysql.ParseDSN(original)
 	if err != nil {
 		t.Fatalf("failed to parse original DSN: %v", err)
 	}
-	parsed.ReadTimeout = 5 * time.Minute
+	parsed.ReadTimeout = doltSyncReadTimeout()
 	rewritten := parsed.FormatDSN()
 
 	reParsed, err := mysql.ParseDSN(rewritten)
 	if err != nil {
 		t.Fatalf("failed to parse rewritten DSN: %v", err)
 	}
-	if reParsed.ReadTimeout != 5*time.Minute {
-		t.Errorf("expected readTimeout=5m, got %v", reParsed.ReadTimeout)
+	if want := 42 * time.Minute; reParsed.ReadTimeout != want {
+		t.Errorf("expected sync readTimeout to follow BEADS_DOLT_PUSH_TIMEOUT=%v, got %v", want, reParsed.ReadTimeout)
+	}
+	if reParsed.ReadTimeout == 5*time.Minute {
+		t.Errorf("sync readTimeout must not be the former hardcoded 5m (be-6ebm0 regression)")
 	}
 }
 

@@ -1278,9 +1278,11 @@ func buildServerDSN(cfg *Config, database string) string {
 	return parsed.FormatDSN()
 }
 
-// execWithLongTimeout opens a one-shot database connection with readTimeout=5m
-// and executes the given query. Push/pull operations can exceed the default
-// readTimeout when the server performs network I/O to git remotes.
+// execWithLongTimeout opens a one-shot database connection with a long read
+// deadline (doltSyncReadTimeout — default 30m, configurable via
+// BEADS_DOLT_PUSH_TIMEOUT) and executes the given query. Push/pull operations can
+// exceed the default 10s pool readTimeout when the server performs network I/O to
+// git remotes.
 //
 // The query is wrapped in an explicit transaction (BEGIN/COMMIT) so that
 // DOLT_PULL merge operations succeed even when the server runs with
@@ -1291,7 +1293,7 @@ func (s *DoltStore) execWithLongTimeout(ctx context.Context, query string, args 
 	if err != nil {
 		return fmt.Errorf("failed to parse DSN for long-timeout connection: %w", err)
 	}
-	cfg.ReadTimeout = 5 * time.Minute
+	cfg.ReadTimeout = doltSyncReadTimeout()
 	db, err := sql.Open("mysql", cfg.FormatDSN())
 	if err != nil {
 		return fmt.Errorf("failed to open long-timeout connection: %w", err)
@@ -1318,7 +1320,7 @@ func (s *DoltStore) execWithLongTimeoutNoTx(ctx context.Context, query string, a
 	if err != nil {
 		return fmt.Errorf("failed to parse DSN for long-timeout connection: %w", err)
 	}
-	cfg.ReadTimeout = 5 * time.Minute
+	cfg.ReadTimeout = doltSyncReadTimeout()
 	db, err := sql.Open("mysql", cfg.FormatDSN())
 	if err != nil {
 		return fmt.Errorf("failed to open long-timeout connection: %w", err)
@@ -2311,7 +2313,7 @@ func (s *DoltStore) pullWithAutoResolve(ctx context.Context, query string, args 
 	if err != nil {
 		return fmt.Errorf("failed to parse DSN for long-timeout connection: %w", err)
 	}
-	cfg.ReadTimeout = 5 * time.Minute
+	cfg.ReadTimeout = doltSyncReadTimeout()
 	db, err := sql.Open("mysql", cfg.FormatDSN())
 	if err != nil {
 		return fmt.Errorf("failed to open long-timeout connection: %w", err)

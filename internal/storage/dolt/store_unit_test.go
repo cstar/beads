@@ -500,6 +500,40 @@ func TestExecWithLongTimeoutDSNRewrite(t *testing.T) {
 	}
 }
 
+// TestDoltSyncReadTimeout verifies the configurable client read deadline applied
+// to the one-shot CALL DOLT_PUSH / DOLT_PULL connections (be-6ebm0). It defaults
+// to 30m when unset, honours a valid Go duration override, treats "0" as "no
+// deadline" (go-sql-driver semantics), and falls back to the default on an
+// unparseable value. Pure env parsing — no Dolt server required.
+func TestDoltSyncReadTimeout(t *testing.T) {
+	const envKey = "BEADS_DOLT_PUSH_TIMEOUT"
+	tests := []struct {
+		name string
+		set  bool
+		env  string
+		want time.Duration
+	}{
+		{"default when unset", false, "", 30 * time.Minute},
+		{"explicit 45m override", true, "45m", 45 * time.Minute},
+		{"zero disables deadline", true, "0", 0},
+		{"invalid falls back to default", true, "not-a-duration", 30 * time.Minute},
+		{"whitespace trimmed", true, "  20m  ", 20 * time.Minute},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// t.Setenv snapshots the original value and restores it on cleanup,
+			// so it is safe to Unsetenv afterwards for the "unset" case.
+			t.Setenv(envKey, tt.env)
+			if !tt.set {
+				os.Unsetenv(envKey)
+			}
+			if got := doltSyncReadTimeout(); got != tt.want {
+				t.Errorf("doltSyncReadTimeout() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestBuildServerDSN_SpecialCharacterPassword verifies that passwords with
 // characters that collide with DSN delimiters (@ : / ? & < > etc.) are
 // properly escaped by FormatDSN. This was a real bug — passwords from Secret

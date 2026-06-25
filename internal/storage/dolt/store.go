@@ -1329,6 +1329,30 @@ func (s *DoltStore) execWithLongTimeoutNoTx(ctx context.Context, query string, a
 	return err
 }
 
+// doltSyncReadTimeout returns the MySQL client read-deadline applied to the
+// one-shot connections that run CALL DOLT_PUSH / DOLT_PULL. These commands block
+// while the dolt sql-server streams the delta to the git+ssh remote, emitting no
+// intermediate packets — so a fixed read deadline shorter than the upload aborts
+// an otherwise-healthy push (be-6ebm0: the `po` store took 5m08s and tripped the
+// previous hardcoded 5m deadline, leaving the remote head un-advanced).
+//
+// Override with BEADS_DOLT_PUSH_TIMEOUT (Go duration, e.g. "45m"); it governs
+// BOTH push and pull long-timeout connections. A value that parses to zero
+// ("0", "0s") disables the deadline entirely (unbounded — rely on context /
+// SIGINT for cancellation). An unparseable value is ignored and the default used.
+func doltSyncReadTimeout() time.Duration {
+	const def = 30 * time.Minute
+	raw := strings.TrimSpace(os.Getenv("BEADS_DOLT_PUSH_TIMEOUT"))
+	if raw == "" {
+		return def
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return def
+	}
+	return d // d == 0 → go-sql-driver treats as "no read timeout"
+}
+
 // applyPoolLimits configures the pool on db using the sensible-default
 // connection pool limits, overridden by any non-zero Config fields.
 //

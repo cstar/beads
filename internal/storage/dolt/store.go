@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -2272,6 +2273,47 @@ func (s *DoltStore) pullFromRemote(ctx context.Context, remote string) (retErr e
 	})
 }
 
+// ConflictsRemainError reports merge conflicts that survived auto-resolution and
+// remain in the working set after a pull. The pull transaction is committed with
+// the conflicts preserved (dolt_allow_commit_conflicts is set), so they stay
+// recoverable via `bd dolt conflicts resolve` rather than being silently dropped.
+// Counts maps each still-conflicted table to its number of conflicting rows.
+type ConflictsRemainError struct {
+	Counts map[string]int
+}
+
+func (e *ConflictsRemainError) Error() string {
+	tables := make([]string, 0, len(e.Counts))
+	for t := range e.Counts {
+		tables = append(tables, t)
+	}
+	sort.Strings(tables)
+	parts := make([]string, 0, len(tables))
+	for _, t := range tables {
+		parts = append(parts, fmt.Sprintf("%s (%d)", t, e.Counts[t]))
+	}
+	return fmt.Sprintf("merge left unresolved conflicts in: %s", strings.Join(parts, ", "))
+}
+
+// detectRemainingConflicts inspects the working set on tx (after a pull/merge and
+// any auto-resolution) and returns a *ConflictsRemainError naming every table that
+// still has conflicts, or (nil, nil) if none remain. It reuses
+// versioncontrolops.GetConflicts so the per-table counts come from dolt_conflicts.
+func (s *DoltStore) detectRemainingConflicts(ctx context.Context, tx *sql.Tx) (*ConflictsRemainError, error) {
+	conflicts, err := versioncontrolops.GetConflicts(ctx, tx)
+	if err != nil {
+		return nil, fmt.Errorf("check remaining conflicts: %w", err)
+	}
+	if len(conflicts) == 0 {
+		return nil, nil
+	}
+	counts := make(map[string]int, len(conflicts))
+	for _, c := range conflicts {
+		counts[c.Field] = c.Count
+	}
+	return &ConflictsRemainError{Counts: counts}, nil
+}
+
 // pullWithAutoResolve executes a DOLT_PULL query with long timeout and auto-resolves
 // metadata-only merge conflicts using "theirs" strategy. This handles the common case
 // where machine-local metadata rows (e.g., dolt_auto_push_*) diverge across clones
@@ -2357,6 +2399,25 @@ func (s *DoltStore) pullWithAutoResolve(ctx context.Context, query string, args 
 		// tables/kinds we cannot safely auto-resolve.
 		_ = tx.Rollback()
 		return pullErr
+	}
+
+	// DOLT_PULL succeeded but may have left conflicts the auto-resolvers above do
+	// not handle (e.g. an issues-table data conflict). Surface them as a typed
+	// error instead of silently committing a wedged store and reporting
+	// "Pull complete."
+	remainErr, derr := s.detectRemainingConflicts(ctx, tx)
+	if derr != nil {
+		_ = tx.Rollback()
+		return derr
+	}
+	if remainErr != nil {
+		// Preserve the merge and its conflicts (allow-commit-conflicts is on) so
+		// they remain resolvable via `bd dolt conflicts resolve`; rolling back
+		// would discard the fetched commits and the conflicts themselves.
+		if cErr := tx.Commit(); cErr != nil {
+			return cErr
+		}
+		return remainErr
 	}
 
 	return tx.Commit()

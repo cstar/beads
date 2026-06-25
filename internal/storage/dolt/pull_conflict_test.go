@@ -927,3 +927,50 @@ func TestPullWithAutoResolve_SurfacesUnresolvedConflicts(t *testing.T) {
 		t.Errorf("expected issues conflict count >= 1, got %+v", cre.Counts)
 	}
 }
+
+// TestConflictsResolveAndCommit verifies that resolving an issues-table conflict
+// with "theirs" and then committing (what `bd dolt conflicts resolve --theirs
+// issues` does) clears the conflict from the working set — i.e. ResolveConflicts
+// stages-and-commits cleanly via store.Commit (GH#2455 stages dirty tables), so
+// GetConflicts is empty afterwards and the store is no longer wedged.
+func TestConflictsResolveAndCommit(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	tx := seedIssuesConflict(t, store, ctx, "resolve-commit")
+
+	// Confirm a conflict materialized, then PERSIST the conflicted working set
+	// (allow-commit-conflicts is set on this tx) and release the single pooled
+	// connection so the store methods below can acquire it.
+	conflicts, err := versioncontrolops.GetConflicts(ctx, tx)
+	if err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("GetConflicts(tx): %v", err)
+	}
+	if len(conflicts) == 0 {
+		_ = tx.Rollback()
+		t.Skip("Dolt auto-merged the issues conflict — nothing to resolve")
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit merge-with-conflicts: %v", err)
+	}
+
+	// Resolve + commit through the store API (the resolve command's core).
+	if err := store.ResolveConflicts(ctx, "issues", "theirs"); err != nil {
+		t.Fatalf("ResolveConflicts: %v", err)
+	}
+	if err := store.Commit(ctx, "resolve issues conflicts (theirs)"); err != nil {
+		t.Fatalf("Commit after resolve: %v", err)
+	}
+
+	remaining, err := store.GetConflicts(ctx)
+	if err != nil {
+		t.Fatalf("GetConflicts after resolve: %v", err)
+	}
+	if len(remaining) != 0 {
+		t.Errorf("expected no conflicts after resolve+commit, got %+v", remaining)
+	}
+}

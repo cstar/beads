@@ -71,3 +71,39 @@ func TestDoltConflictsList(t *testing.T) {
 		}
 	})
 }
+
+// TestDoltConflictsResolveFlags verifies the `bd dolt conflicts resolve` surface:
+// it is registered under `dolt conflicts`, exposes --ours/--theirs/--json, and its
+// pure strategy validator enforces exactly-one-of --ours/--theirs.
+func TestDoltConflictsResolveFlags(t *testing.T) {
+	t.Run("Registered", func(t *testing.T) {
+		conflicts := findSubcommand(doltCmd, "conflicts")
+		if conflicts == nil {
+			t.Fatal("`conflicts` is not registered under `dolt`")
+		}
+		resolve := findSubcommand(conflicts, "resolve")
+		if resolve == nil {
+			t.Fatal("`resolve` is not registered under `dolt conflicts`")
+		}
+		for _, f := range []string{"ours", "theirs", "json"} {
+			if resolve.Flags().Lookup(f) == nil {
+				t.Errorf("`dolt conflicts resolve` is missing the --%s flag", f)
+			}
+		}
+	})
+
+	t.Run("StrategyValidation", func(t *testing.T) {
+		if _, err := resolveStrategy(false, false); err == nil {
+			t.Error("expected an error when neither --ours nor --theirs is set")
+		}
+		if _, err := resolveStrategy(true, true); err == nil {
+			t.Error("expected an error when both --ours and --theirs are set")
+		}
+		if s, err := resolveStrategy(true, false); err != nil || s != "ours" {
+			t.Errorf("--ours: got (%q, %v), want (\"ours\", nil)", s, err)
+		}
+		if s, err := resolveStrategy(false, true); err != nil || s != "theirs" {
+			t.Errorf("--theirs: got (%q, %v), want (\"theirs\", nil)", s, err)
+		}
+	})
+}

@@ -1288,6 +1288,9 @@ func init() {
 	doltCleanDatabasesCmd.Flags().Bool("dry-run", false, "Show what would be dropped without dropping")
 	doltRemoteRemoveCmd.Flags().Bool("force", false, "Force remove even when SQL and CLI URLs conflict")
 	doltConflictsListCmd.Flags().Bool("json", false, "Output conflicts as JSON")
+	doltConflictsResolveCmd.Flags().Bool("ours", false, "Resolve conflicts keeping our side")
+	doltConflictsResolveCmd.Flags().Bool("theirs", false, "Resolve conflicts keeping their side")
+	doltConflictsResolveCmd.Flags().Bool("json", false, "Output the resolution result as JSON")
 	doltRemoteCmd.AddCommand(doltRemoteAddCmd)
 	doltRemoteCmd.AddCommand(doltRemoteListCmd)
 	doltRemoteCmd.AddCommand(doltRemoteRemoveCmd)
@@ -1304,6 +1307,7 @@ func init() {
 	doltCmd.AddCommand(doltCleanDatabasesCmd)
 	doltCmd.AddCommand(doltRemoteCmd)
 	doltConflictsCmd.AddCommand(doltConflictsListCmd)
+	doltConflictsCmd.AddCommand(doltConflictsResolveCmd)
 	doltCmd.AddCommand(doltConflictsCmd)
 	rootCmd.AddCommand(doltCmd)
 }

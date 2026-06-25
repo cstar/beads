@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`bd dolt push`/`pull` no longer abort large uploads at a hardcoded 5-minute
+  deadline (be-6ebm0).** The one-shot sync connections that run `CALL DOLT_PUSH`
+  / `CALL DOLT_PULL` block while the dolt sql-server streams the delta to the
+  `git+ssh` remote; a client read deadline shorter than the upload killed an
+  otherwise-healthy push and left the remote head un-advanced (the HQ `po` store,
+  ~5m08s of upload, tripped the old 5m deadline). The sync read deadline now
+  defaults to **30m** and is configurable via the new `BEADS_DOLT_PUSH_TIMEOUT`
+  environment variable (Go duration; `0` disables it; governs both push and
+  pull). The steady-state 10s pool deadline for normal queries is unchanged.
+
 ## [1.0.5] - 2026-05-28
 
 ### Upgrade Notes

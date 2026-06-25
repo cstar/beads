@@ -2983,6 +2983,18 @@ bd dolt push [flags]
       --remote string   Push to a specific named remote instead of the default
 ```
 
+**Long-upload deadline (`BEADS_DOLT_PUSH_TIMEOUT`).** `bd dolt push` (and
+`bd dolt pull`) open a one-shot connection that blocks while the dolt sql-server
+streams the delta to the `git+ssh` remote, emitting no intermediate packets. A
+client read deadline shorter than that upload aborts an otherwise-healthy push
+and the remote head never advances. That deadline defaults to **30m** and is
+configurable via the `BEADS_DOLT_PUSH_TIMEOUT` environment variable (a Go
+duration, e.g. `45m`, `2h`); it governs **both push and pull**. Set it to `0`
+(or `0s`) to disable the deadline entirely (unbounded — cancellation then relies
+on context / Ctrl-C). An unparseable value is ignored and the 30m default used.
+The deadline applies to the in-process `bd` client, so changing it takes effect
+on the next push/pull with no dolt-server restart.
+
 #### bd dolt remote
 
 Manage Dolt remotes for push/pull replication.

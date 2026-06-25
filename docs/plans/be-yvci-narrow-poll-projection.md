@@ -145,3 +145,53 @@ Heading retained for auditor visibility per planner discipline.
 One bead, one PR. Executor reuses worktree `worktrees/be-yvci` on `gc/be-yvci`
 (base `feat/connection-pooling`), reads this plan, executes T-001…T-007 red-green,
 opens one PR. Slice B (gascity ga-arn) consumes the `--brief` seam from T-006.
+
+## Execution status (beads/voxist.executor)
+
+All gating micro-tasks green and committed on `gc/be-yvci`.
+
+- [x] T-001 — brief work-probe SELECT omits the 7 body cols, keeps metadata+title   ✅ TestReadyWorkBriefProjection (1f6d46ae2)
+- [x] T-002 — `WorkFilter.BriefBodies` + derived `IssueSelectColumnsBrief` (drift-proof) + `briefReadyWorkIssueColumns`   ✅ TestIssueSelectColumnsBrief (1f6d46ae2/b16814ce3)
+- [x] T-003 — `ScanIssueBriefFrom` + shared composite-extras scanner   ✅ TestScanIssueBrief (1f6d46ae2/b16814ce3)
+- [x] T-004 — `runSearchQueryInTx(brief)` branch; `GetReadyWorkWithCountsInTx` threads `filter.BriefBodies`; wide path unchanged   ✅ full issueops green (1f6d46ae2)
+- [x] T-005 — brief keeps routing metadata + counts, bodies empty   ✅ TestReadyWorkBriefKeepsMetadata (b16814ce3)
+- [x] T-006 — `bd ready --brief` seam → `WorkFilter.BriefBodies` (testable helper)   ✅ TestReadyBriefFlag (6a623b24b)
+- [~] T-007 — best-effort, non-gating: documented below (no synthetic benchmark — the win is server-side projection, unmeasurable without a populated dolt store).
+
+### Implementation notes / refinements
+
+- **Drift-proofing.** `IssueSelectColumnsBrief` is **derived** from `IssueSelectColumns`
+  by removing `bodyColumnsOmittedInBrief` (not a hand-kept parallel constant), so it
+  can never drift; `TestIssueSelectColumnsBrief` locks the drop/keep sets.
+- **Coupling risk (plan-flagged) eliminated structurally.** `scanReadyWorkRowWithCounts`
+  and the new `scanReadyWorkBriefRowWithCounts` both delegate to a shared
+  `scanReadyWorkRowWithScanner(rows, scanFn)` — the 6 composite extras
+  (labels_json, dep/rdep/comment counts, parent_id, deps_json) are appended in one
+  place, so brief and wide are guaranteed identical on the extras.
+- **Scope.** `--brief` is wired on `bd ready` only (the gascity ga-arn work_query
+  command). `bd list --ready` (via `readyWorkFilterFromIssueFilter`) is left wide —
+  per the plan's open question, a trivial follow-on if a second probe needs it.
+- **Column counts.** The canonical list is 46 columns (the plan's "47" was off by
+  one); brief is 39 (drops exactly the 7 named body columns: 5 LONGTEXT
+  description/design/acceptance_criteria/notes/close_reason + 2 TEXT payload/waiters).
+
+### T-007 — measured delta (documented)
+
+The architect measured the wide projection at **7–12× the brief projection for the
+same matched rows** (be-yvci comments). The structural reduction this PR ships: the
+work-probe SELECT now projects 39/46 issue columns, dropping all 5 LONGTEXT + 2 TEXT
+free-text/blob bodies the probe never displays. A local micro-benchmark is **not**
+included: the cost is server-side (Dolt materializing LONGTEXT into the result set),
+not client scan time, so a sqlmock/in-process benchmark would misrepresent it. The
+fleet-level `SHOW GLOBAL STATUS` Com_select / CPU drop is realized when Slice B
+(gascity ga-arn) flips `--brief` on the supervisor probe — explicitly **not** this
+bead's gate.
+
+### Verification
+
+`go build -tags=gms_pure_go ./...` green; `gofmt`/`go vet` clean (issueops, types,
+cmd/bd); `go test ./internal/storage/issueops/... ./internal/types/...` green; the
+new `bd ready` command tests green; the CI pure-Go (`CGO_ENABLED=0`) cmd/bd test
+binary compiles. The Docker-backed dolt store tests and the `BEADS_DOLT_SERVER_PORT`-
+sensitive `TestApplyConfigDefaults_*` tests are unaffected (this change is confined
+to issueops/types/cmd-bd) and run clean in CI.

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,170 @@ import (
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 )
+
+// fakeConflictResolver is a deterministic, no-Dolt-server stand-in for the store
+// surface the resolve command drives, so the resolve wiring (table selection,
+// per-table resolve, commit) is covered by the standard CI gate.
+type fakeConflictResolver struct {
+	conflicts   []storage.Conflict
+	getErr      error
+	resolveErr  error
+	commitErr   error
+	getCalls    int
+	resolved    [][2]string // {table, strategy} per ResolveConflicts call, in order
+	commitCalls int
+	commitMsg   string
+}
+
+func (f *fakeConflictResolver) GetConflicts(_ context.Context) ([]storage.Conflict, error) {
+	f.getCalls++
+	return f.conflicts, f.getErr
+}
+
+func (f *fakeConflictResolver) ResolveConflicts(_ context.Context, table, strategy string) error {
+	if f.resolveErr != nil {
+		return f.resolveErr
+	}
+	f.resolved = append(f.resolved, [2]string{table, strategy})
+	return nil
+}
+
+func (f *fakeConflictResolver) Commit(_ context.Context, message string) error {
+	f.commitCalls++
+	f.commitMsg = message
+	return f.commitErr
+}
+
+// TestResolveConflictsCore covers the resolve command's wiring without a live
+// Dolt store: explicit-table vs all-conflicted selection, the per-table resolve
+// loop, the single commit, and the error/no-op paths.
+func TestResolveConflictsCore(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("ExplicitTable", func(t *testing.T) {
+		f := &fakeConflictResolver{}
+		tables, err := resolveConflictsCore(ctx, f, "issues", "theirs")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(tables) != 1 || tables[0] != "issues" {
+			t.Errorf("expected [issues], got %v", tables)
+		}
+		if f.getCalls != 0 {
+			t.Errorf("explicit table must not call GetConflicts, got %d calls", f.getCalls)
+		}
+		if len(f.resolved) != 1 || f.resolved[0] != [2]string{"issues", "theirs"} {
+			t.Errorf("expected resolve(issues, theirs), got %v", f.resolved)
+		}
+		if f.commitCalls != 1 {
+			t.Errorf("expected exactly one commit, got %d", f.commitCalls)
+		}
+	})
+
+	t.Run("AllConflictedTables", func(t *testing.T) {
+		f := &fakeConflictResolver{conflicts: []storage.Conflict{{Field: "issues"}, {Field: "labels"}}}
+		tables, err := resolveConflictsCore(ctx, f, "", "ours")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(tables) != 2 || tables[0] != "issues" || tables[1] != "labels" {
+			t.Errorf("expected [issues labels], got %v", tables)
+		}
+		if f.getCalls != 1 {
+			t.Errorf("expected one GetConflicts call, got %d", f.getCalls)
+		}
+		if len(f.resolved) != 2 || f.resolved[0] != [2]string{"issues", "ours"} || f.resolved[1] != [2]string{"labels", "ours"} {
+			t.Errorf("expected both tables resolved with ours, got %v", f.resolved)
+		}
+		if f.commitCalls != 1 {
+			t.Errorf("expected exactly one commit, got %d", f.commitCalls)
+		}
+	})
+
+	t.Run("NoConflictsIsNoOp", func(t *testing.T) {
+		f := &fakeConflictResolver{conflicts: nil}
+		tables, err := resolveConflictsCore(ctx, f, "", "ours")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(tables) != 0 {
+			t.Errorf("expected no tables, got %v", tables)
+		}
+		if f.commitCalls != 0 {
+			t.Errorf("no conflicts must not commit, got %d commits", f.commitCalls)
+		}
+	})
+
+	t.Run("ResolveErrorAborts", func(t *testing.T) {
+		f := &fakeConflictResolver{resolveErr: errors.New("boom")}
+		_, err := resolveConflictsCore(ctx, f, "issues", "theirs")
+		if err == nil {
+			t.Fatal("expected error from ResolveConflicts")
+		}
+		if f.commitCalls != 0 {
+			t.Errorf("resolve failure must not commit, got %d commits", f.commitCalls)
+		}
+	})
+
+	t.Run("CommitErrorPropagates", func(t *testing.T) {
+		f := &fakeConflictResolver{commitErr: errors.New("commit failed")}
+		_, err := resolveConflictsCore(ctx, f, "issues", "theirs")
+		if err == nil {
+			t.Fatal("expected error from Commit")
+		}
+	})
+
+	t.Run("GetConflictsErrorPropagates", func(t *testing.T) {
+		f := &fakeConflictResolver{getErr: errors.New("query failed")}
+		_, err := resolveConflictsCore(ctx, f, "", "ours")
+		if err == nil {
+			t.Fatal("expected error from GetConflicts")
+		}
+		if f.commitCalls != 0 {
+			t.Errorf("must not commit when selection fails, got %d", f.commitCalls)
+		}
+	})
+}
+
+// TestFormatResolveResult covers the resolve output formatter (text, JSON, no-op).
+func TestFormatResolveResult(t *testing.T) {
+	t.Run("Text", func(t *testing.T) {
+		out, err := formatResolveResult([]string{"issues"}, "theirs", false)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(out, "issues") || !strings.Contains(out, "theirs") {
+			t.Errorf("text summary missing table/strategy: %q", out)
+		}
+	})
+
+	t.Run("NoOp", func(t *testing.T) {
+		out, err := formatResolveResult(nil, "ours", false)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(strings.ToLower(out), "no conflicts") {
+			t.Errorf("expected no-op message, got %q", out)
+		}
+	})
+
+	t.Run("JSON", func(t *testing.T) {
+		out, err := formatResolveResult([]string{"issues", "labels"}, "ours", true)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		var parsed struct {
+			Strategy string   `json:"strategy"`
+			Resolved []string `json:"resolved"`
+		}
+		if err := json.Unmarshal([]byte(out), &parsed); err != nil {
+			t.Fatalf("output is not valid JSON: %v\n%s", err, out)
+		}
+		if parsed.Strategy != "ours" || len(parsed.Resolved) != 2 {
+			t.Errorf("unexpected JSON: %+v", parsed)
+		}
+	})
+}
 
 // findSubcommand returns the child of parent whose Name() == name, or nil.
 func findSubcommand(parent *cobra.Command, name string) *cobra.Command {
@@ -116,6 +281,7 @@ func TestDoltConflictsResolveFlags(t *testing.T) {
 //   - isConflictsRemainErr detects a (wrapped) *ConflictsRemainError from the store,
 //   - isInConflictErr detects the pre-pull "table(s) ... are in conflict" wedge,
 //   - printConflictResolutionGuidance points the operator at `bd dolt conflicts`.
+//
 // The doltPullCmd error branches wire these together; because the store now returns
 // a non-nil error on unresolved conflicts (T-004), "Pull complete." is never reached.
 func TestDoltPull_ConflictGuidance(t *testing.T) {

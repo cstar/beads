@@ -131,6 +131,48 @@ func formatResolveResult(tables []string, strategy string, asJSON bool) (string,
 	return fmt.Sprintf("Resolved %d table(s) with --%s: %s", len(tables), strategy, strings.Join(tables, ", ")), nil
 }
 
+// conflictResolver is the minimal store surface `bd dolt conflicts resolve`
+// drives. Extracted so the resolve wiring (table selection, per-table resolve,
+// commit) is unit-testable without a live Dolt store; storage.DoltStorage (the
+// concrete type returned by storeForRawDoltSync) satisfies it.
+type conflictResolver interface {
+	GetConflicts(ctx context.Context) ([]storage.Conflict, error)
+	ResolveConflicts(ctx context.Context, table, strategy string) error
+	Commit(ctx context.Context, message string) error
+}
+
+// resolveConflictsCore selects the target tables (the explicit [table] arg, or
+// every currently-conflicted table when table is empty), resolves each with the
+// given strategy, then commits once. Returns the resolved tables — nil when there
+// was nothing to resolve, in which case no commit is issued.
+func resolveConflictsCore(ctx context.Context, st conflictResolver, table, strategy string) ([]string, error) {
+	var tables []string
+	if table != "" {
+		tables = []string{table}
+	} else {
+		conflicts, err := st.GetConflicts(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, c := range conflicts {
+			tables = append(tables, c.Field)
+		}
+	}
+	if len(tables) == 0 {
+		return nil, nil
+	}
+	for _, tbl := range tables {
+		if err := st.ResolveConflicts(ctx, tbl, strategy); err != nil {
+			return nil, fmt.Errorf("resolving %s: %w", tbl, err)
+		}
+	}
+	msg := fmt.Sprintf("bd dolt conflicts resolve --%s (%s)", strategy, strings.Join(tables, ", "))
+	if err := st.Commit(ctx, msg); err != nil {
+		return nil, fmt.Errorf("committing resolution: %w", err)
+	}
+	return tables, nil
+}
+
 var doltConflictsResolveCmd = &cobra.Command{
 	Use:   "resolve [table]",
 	Short: "Resolve merge conflicts with --ours or --theirs (and commit)",
@@ -159,35 +201,13 @@ the wedged state so writes succeed again. Use --json for machine-readable output
 		}
 
 		// Target tables: the explicit arg, or every currently-conflicted table.
-		var tables []string
+		tableArg := ""
 		if len(args) == 1 {
-			tables = []string{args[0]}
-		} else {
-			conflicts, err := st.GetConflicts(ctx)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
-			for _, c := range conflicts {
-				tables = append(tables, c.Field)
-			}
+			tableArg = args[0]
 		}
-
-		if len(tables) == 0 {
-			out, _ := formatResolveResult(nil, strategy, asJSON)
-			fmt.Println(out)
-			return
-		}
-
-		for _, tbl := range tables {
-			if err := st.ResolveConflicts(ctx, tbl, strategy); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: resolving %s: %v\n", tbl, err)
-				os.Exit(1)
-			}
-		}
-		msg := fmt.Sprintf("bd dolt conflicts resolve --%s (%s)", strategy, strings.Join(tables, ", "))
-		if err := st.Commit(ctx, msg); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: committing resolution: %v\n", err)
+		tables, err := resolveConflictsCore(ctx, st, tableArg, strategy)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
 

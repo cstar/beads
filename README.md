@@ -213,3 +213,23 @@ This is useful for:
 
 * [Documentation site](https://beads.gascity.com/) | [Installing](docs/getting-started/installation.md) | [Sync Concepts](docs/core-concepts/sync-concepts.md) | [Agent Workflow](AGENT_INSTRUCTIONS.md) | [Copilot CLI Setup](docs/integrations/copilot-cli.md) | [Copilot VS Code MCP](docs/integrations/github-copilot.md) | [Articles](ARTICLES.md) | [Sync Branch Mode](docs/reference/protected-branches.md) | [Troubleshooting](docs/reference/troubleshooting.md) | [FAQ](docs/reference/faq.md)
 * [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/gastownhall/beads)
+
+## Read-only Go consumers
+
+Go applications that only inspect an existing workspace can keep a read-only
+storage handle open and reuse it for successive queries:
+
+```go
+store, err := beads.OpenReadyReader(ctx, "/path/to/project/.beads")
+if err != nil {
+    return err
+}
+defer store.Close()
+ready, err := store.GetReadyWork(ctx, beads.WorkFilter{})
+```
+
+`OpenReadyReader` uses the configured backend and exposes only readiness queries
+and `Close`, without writable methods or access to the underlying store. It does not create
+storage, migrate schemas, or start a Dolt server. Registered backends use their
+read-only factory; embedded storage requires CGO. Close the handle before
+changing the workspace's backend or connection configuration, then open it again.

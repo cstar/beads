@@ -350,6 +350,13 @@ func applyResolvedConfig(ctx context.Context, beadsDir string, fileCfg *configfi
 	return nil
 }
 
+// ApplyCentralConfigDefaults resolves central server defaults before a caller
+// selects the embedded or server backend. It follows the same best-effort
+// loading policy as NewFromConfigWithOptions.
+func ApplyCentralConfigDefaults(fileCfg *configfile.Config) {
+	applyCentralConfigDefaults(fileCfg)
+}
+
 // applyCentralConfigDefaults loads the central server config from
 // ~/.config/beads/server.json (or BEADS_CENTRAL_CONFIG env var) and
 // applies its server fields as defaults to the per-project config.

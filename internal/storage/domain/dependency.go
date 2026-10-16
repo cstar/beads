@@ -47,6 +47,11 @@ type BlockingInfo struct {
 
 type DependencySQLRepository interface {
 	Insert(ctx context.Context, dep *types.Dependency, actor string, opts DepInsertOpts) error
+	// RecomputeIsBlocked re-derives the denormalized issues.is_blocked /
+	// wisps.is_blocked flag for the given IDs, iterating to a fixpoint.
+	// Callers must invoke it after inserting dependency rows so bd ready
+	// (which filters on is_blocked = 0) sees the new edges.
+	RecomputeIsBlocked(ctx context.Context, issueIDs, wispIDs []string) error
 	HasCycle(ctx context.Context, issueID, dependsOnID string) (bool, error)
 	ListByIssueIDs(ctx context.Context, issueIDs []string, opts DepListOpts) (DepBulkResult, error)
 	CountsByIssueIDs(ctx context.Context, issueIDs []string, opts DepCountsOpts) (map[string]*types.DependencyCounts, error)
@@ -107,6 +112,19 @@ func (u *dependencyUseCaseImpl) add(ctx context.Context, dep *types.Dependency, 
 
 	if err := u.depRepo.Insert(ctx, dep, actor, DepInsertOpts{UseWispsTable: useWisp}); err != nil {
 		return fmt.Errorf("add dep: insert: %w", err)
+	}
+
+	// Keep the denormalized is_blocked flag in sync: the source issue may
+	// have just gained an open blocker (blocks/conditional-blocks), a blocked
+	// parent (parent-child), or an unsatisfied waits-for gate.
+	var issueIDs, wispIDs []string
+	if useWisp {
+		wispIDs = []string{dep.IssueID}
+	} else {
+		issueIDs = []string{dep.IssueID}
+	}
+	if err := u.depRepo.RecomputeIsBlocked(ctx, issueIDs, wispIDs); err != nil {
+		return fmt.Errorf("add dep: recompute is_blocked: %w", err)
 	}
 	return nil
 }
